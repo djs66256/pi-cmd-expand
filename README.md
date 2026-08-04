@@ -29,25 +29,31 @@ directory of the prompt or the context file.
 
 ## Install
 
-### Project-local
+Install from the
+[npm registry](https://www.npmjs.com/package/pi-cmd-expand).
+
+### User-global (`~/.pi/agent/settings.json`)
 
 ```bash
-pi install /absolute/path/to/pi-cmd-expand
-# or
-pi install ./pi-cmd-expand
+pi install npm:pi-cmd-expand
 ```
 
-### User-global
+### Project-local (`.pi/settings.json` — share with your team)
 
 ```bash
-pi install /absolute/path/to/pi-cmd-expand -l
+pi install npm:pi-cmd-expand -l
 ```
 
 ### Quick try without installing
 
 ```bash
-pi -e /absolute/path/to/pi-cmd-expand/src/index.ts
+pi -e npm:pi-cmd-expand
 ```
+
+> To pin a version, append `@x.y.z`, e.g.
+> `pi install npm:pi-cmd-expand@0.1.0`. Pinned installs are skipped
+> by `pi update --extensions` and only change via an explicit
+> `pi install npm:pi-cmd-expand@<new-version>`.
 
 ## Example
 

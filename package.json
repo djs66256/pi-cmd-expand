@@ -27,6 +27,14 @@
 		"LICENSE"
 	],
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/djs66256/pi-cmd-expand.git"
+	},
+	"bugs": {
+		"url": "https://github.com/djs66256/pi-cmd-expand/issues"
+	},
+	"homepage": "https://github.com/djs66256/pi-cmd-expand#readme",
 	"engines": {
 		"node": ">=20"
 	},

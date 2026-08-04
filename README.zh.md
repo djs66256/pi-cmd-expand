@@ -29,25 +29,29 @@ ls -la
 
 ## 安装
 
-### 项目内
+从 [npm registry](https://www.npmjs.com/package/pi-cmd-expand) 安装。
+
+### 用户全局（`~/.pi/agent/settings.json`）
 
 ```bash
-pi install /absolute/path/to/pi-cmd-expand
-# 或者
-pi install ./pi-cmd-expand
+pi install npm:pi-cmd-expand
 ```
 
-### 用户全局
+### 项目本地（`.pi/settings.json`，可与团队共享）
 
 ```bash
-pi install /absolute/path/to/pi-cmd-expand -l
+pi install npm:pi-cmd-expand -l
 ```
 
 ### 不安装、直接试一下
 
 ```bash
-pi -e /absolute/path/to/pi-cmd-expand/src/index.ts
+pi -e npm:pi-cmd-expand
 ```
+
+> 想锁版本，追加 `@x.y.z`，例如 `pi install npm:pi-cmd-expand@0.1.0`。
+> 带版本号的安装会被 `pi update --extensions` 跳过，只能通过
+> 显式 `pi install npm:pi-cmd-expand@<新版本>` 升级。
 
 ## 示例
 

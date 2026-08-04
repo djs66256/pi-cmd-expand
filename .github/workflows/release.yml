@@ -1,0 +1,84 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g. `git tag v0.1.1 && git push --tags`.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Allow manual runs for re-publishing or dry-runs; `inputs.tag` is unused but
+# the workflow_dispatch trigger makes it easy to debug.
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Biome check
+        run: npx biome check .
+
+  publish:
+    name: publish to npm
+    needs: test
+    runs-on: ubuntu-latest
+    # `id-token: write` is required for `npm publish --provenance`
+    # (OIDC trusted publishing). `contents: write` lets us create a
+    # GitHub release below.
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify package version matches the pushed tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "$TAG" ]; then
+            echo "::error::package.json version (${PKG_VERSION}) does not match tag (${TAG})"
+            echo "Bump the version with \`npm version\` and re-tag, or fix the tag."
+            exit 1
+          fi
+          echo "Releasing ${PKG_VERSION}"
+
+      - name: Publish to npm
+        # Trusted publishing via OIDC: the GitHub Actions OIDC token
+        # is exchanged for an npm publish token at publish time, so no
+        # long-lived `NPM_TOKEN` secret is required. Requires:
+        #   1. `id-token: write` permission above.
+        #   2. Trusted-publisher config on npmjs.com pointing at this
+        #      repo + workflow file (one-time, in package settings).
+        # `--provenance` attaches an SLSA-style build provenance
+        # attestation to the published tarball.
+        # The package is unscoped, so it is public by default;
+        # `--access public` is explicit for clarity.
+        run: npm publish --provenance --access public
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
