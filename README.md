@@ -74,16 +74,30 @@ The expansion rule is intentionally narrow:
 
 | Source                                            | Expanded?            |
 | ------------------------------------------------- | -------------------- |
-|  `` `!`cmd` ``  in a typed message                       | ✅ `input` event     |
+|  `` `!`cmd` ``  in a directly-typed message              | ✅ `message_end` (LLM only — the on-screen chat bubble shows the raw `` `!`cmd` `` form because pi does not re-render the user message on `message_end`) |
+|  `` `!`cmd` ``  inside a prompt template (`/foo`) or skill body | ✅ `message_end` (post-template expansion) |
 |  `` `!`cmd` ``  in `AGENTS.md` / `CLAUDE.md`             | ✅ `before_agent_start` |
 | `!cmd` at the start of a line                     | ❌ pi's native `!bash` |
 | Commands the LLM runs via its `bash` tool         | ❌ untouched         |
 | Files the agent reads with `read`                 | ❌ only project-context files |
 
-The `user_bash` / `tool_call` / `tool_result` hooks are deliberately
-left unregistered so pi's native `!bash` (with its `!!`,
-cancellation, and live-streaming semantics) and the agent's own
-`bash` tool keep working untouched.
+The `input` / `user_bash` / `tool_call` / `tool_result` hooks are
+deliberately left unregistered: `input` because the on-screen TUI
+cannot show the expanded text for the template-body case anyway, and
+centralising everything in `message_end` keeps both the typed and
+template paths on the same in-place rewrite contract; `user_bash` so
+pi's native `!bash` (with its `!!`, cancellation, and live-streaming
+semantics) keeps working untouched; `tool_call` / `tool_result` so
+the agent's own `bash` tool is not pre- or post-processed.
+
+> **Why one hook for user input?** The `message_end` event fires
+> *after* template / skill expansion but *before* the LLM call
+> (see [docs/extensions.md](https://pi.dev/docs/extensions#message_end)),
+> so the user message it sees already contains the
+> `` `!`cmd` `` form whether the user typed it directly or it came
+> from a prompt-template / skill body. Rewriting it in place inside
+> `message_end` covers both cases with a single path. See
+> [AGENTS.md](./AGENTS.md) for the full rationale.
 
 ## Behaviour
 

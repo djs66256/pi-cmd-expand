@@ -14,11 +14,11 @@
  * All commands execute in the agent's current working directory
  * (ctx.cwd), not the directory of the prompt / context file.
  *
- * - For user input: hooks the `input` event and transforms the text
- *   in place. Works for `!`cmd`` anywhere in the typed message.
- * - For context files: hooks `before_agent_start` and substitutes
- *   the expanded content into the system prompt where the
- *   <project_instructions path="..."> block is inlined.
+ * - For user input: hooks the `message_end` event and transforms the
+ *   text in place. Works for both directly-typed `!`cmd`` and for
+ *   `!`cmd`` that lives inside a prompt template / skill body
+ *   (the body lands in the user message *after* template expansion,
+ *   so a pre-expansion `input` hook never sees it).
  *
  * Expansion runs once per unique file content (cached by path + mtime)
  * so repeat turns do not re-execute the same shell commands.
@@ -253,6 +253,26 @@ function reEscape(s: string): string {
 }
 
 /**
+ * Extract the concatenated text from a message's `content` field.
+ * The `message_end` event always passes content as a `ContentBlock[]`
+ * (see agent-session.js:865 where the user message is built), but we
+ * also accept a bare string in case a future pi version passes one.
+ * Mirrors `contentText` from `@earendil-works/pi-ai` but inlined to
+ * avoid adding a transitive dep just for one 4-line helper.
+ */
+function extractUserText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(block): block is { type: string; text?: string } =>
+				typeof block === "object" && block !== null && (block as { type?: unknown }).type === "text",
+		)
+		.map((block) => block.text ?? "")
+		.join("\n");
+}
+
+/**
  * Substitute the expanded content of a context file into the system prompt.
  * The project context is rendered as:
  *   <project_instructions path="FILEPATH">\n{content}\n</project_instructions>
@@ -289,24 +309,44 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 	// break pi's own `!!` (excludeFromContext) / cancellation / live
 	// streaming semantics. So we let pi own this path.
 
-	// --- 1) `!cmd` anywhere in the typed message ------------------------
-	// The `input` event fires before skill/template expansion, so this
-	// is the right place to substitute `!`...`` inside what the user
-	// typed (mid-message, not at the start of a line).
-	pi.on("input", async (event, ctx) => {
-		// Skip non-interactive sources (RPC, extension-queued messages)
-		if (event.source !== "interactive") return;
-		if (!event.text.includes("!")) return;
+	// --- 1) `!cmd` in a typed message OR inside a prompt template / skill
+	//     body -----------------------------------------------------
+	// The `input` event fires before skill/template expansion, so it only
+	// ever sees the raw `/template-name` text for template-sourced input
+	// (no `!` in it, can't help). The `message_end` event fires after
+	// template expansion with the final user message, so it sees the
+	// `!`...`` whether the user typed it directly or it came from a
+	// template body, and rewrites the user message in place before the
+	// LLM call.
+	//
+	// TUI trade-off: pi renders the user message into the chat history
+	// in `message_start` and does not re-render on `message_end` for the
+	// user role, so the on-screen text in the chat will show the raw
+	// `!`...`` form even though the LLM sees the expanded output. That
+	// is a pi design gap, not something this extension can paper over.
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "user") return;
+		const text = extractUserText(event.message.content);
+		if (!text || !text.includes("!")) return;
 
-		const text = await expandText(event.text, ctx.cwd, timeoutMs);
-		if (text === event.text) return;
-		return { action: "transform", text };
+		const expanded = await expandText(text, ctx.cwd, timeoutMs);
+		if (expanded === text) return;
+		return {
+			message: {
+				...event.message,
+				content: [{ type: "text", text: expanded }],
+			},
+		};
 	});
 
 	// --- 2) Project context files (AGENTS.md / CLAUDE.md) ----------------
-	// `before_agent_start` gives us the freshly-built system prompt plus
-	// the structured contextFiles list, so we know exactly which file
-	// each block came from.
+	// `before_agent_start` is the ONLY hook in pi that exposes the
+	// fully-assembled system prompt AND the structured `contextFiles`
+	// list (with `path` and `content`). No other event carries either:
+	// `agent_start` / `agent_end` / `context` / `message_end` /
+	// `turn_end` are all message- or lifecycle-scoped, not
+	// system-prompt-scoped. So if you want `!`cmd`` to expand inside
+	// `AGENTS.md` / `CLAUDE.md`, this hook is not optional.
 	pi.on("before_agent_start", async (event, ctx) => {
 		const contextFiles = event.systemPromptOptions?.contextFiles;
 		if (!contextFiles || contextFiles.length === 0) return;

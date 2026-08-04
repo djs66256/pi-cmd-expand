@@ -1,5 +1,5 @@
 ---
-description: Test inline `!`cmd`` form in the middle of a message (input event path)
+description: Test inline `!`cmd`` form — exercised via the `message_end` hook because this is a prompt template
 ---
 
 Please summarise what's in this directory in one sentence, then verify with:

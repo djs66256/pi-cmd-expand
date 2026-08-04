@@ -74,15 +74,21 @@ pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件�
 
 | 来源 | 是否展开 |
 | --- | --- |
-| 用户消息中的  `` `!`cmd` ``  | ✅ `input` 事件 |
+| 用户直接敲的  `` `!`cmd` ``  | ✅ `message_end` 事件（LLM 能看到展开后文本；TUI 聊天区的 user message 气泡仍然显示 `!`cmd` 源码，因为 pi 在 `message_end` 不重渲染 user 消息） |
+| prompt 模板（`/foo`）或 skill（`/skill:bar`）正文里的  `` `!`cmd` ``  | ✅ `message_end` 事件（template 展开之后） |
 | `AGENTS.md` / `CLAUDE.md` 中的  `` `!`cmd` ``  | ✅ `before_agent_start` 事件 |
 | 行首的 `!cmd` | ❌ pi 原生的 `!bash` |
 | LLM 通过 `bash` 工具执行的命令 | ❌ 不动 |
 | agent 用 `read` 工具读的文件 | ❌ 只有项目上下文文件会被展开 |
 
-`user_bash` / `tool_call` / `tool_result` 这三个钩子**故意不**注册，
-这样 pi 原生的 `!bash`（含 `!!`、取消、实时流式）和 agent 自带的
-`bash` 工具都保持原样工作。
+`input` / `user_bash` / `tool_call` / `tool_result` 这四个钩子**故意不**注册：`input` 是因为 TUI 对 template-body 场景本来就显示不出展开后文本，集中到 `message_end` 后直接键入和模板体两条路径走同一套 in-place 重写协议；`user_bash` 是为了 pi 原生的 `!bash`（含 `!!`、取消、实时流式）保持原样；`tool_call` / `tool_result` 是为了 agent 自带的 `bash` 工具不被提前展开。
+
+> **为什么用户输入只要一个钩子？** `message_end` 事件在模板 /
+> skill 展开**之后**、LLM 调用**之前**触发（见 pi
+> [docs/extensions.md#message_end](https://pi.dev/docs/extensions#message_end)），
+> 所以不管是直接键入还是模板体带来的 `` `!`cmd` ``，此时都已经
+> 在 user message 里了，在 `message_end` 里原地改写就同时覆盖两条
+> 路径。完整原理见 [AGENTS.md](./AGENTS.md)。
 
 ## 行为说明
 

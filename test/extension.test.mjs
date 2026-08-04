@@ -35,7 +35,7 @@ const handlers = {};
 factory({ on(event, handler) { handlers[event] = handler; } });
 
 // Hooks this extension DOES register (expansion paths).
-for (const event of ["input", "before_agent_start"]) {
+for (const event of ["message_end", "before_agent_start"]) {
 	assert.equal(
 		typeof handlers[event],
 		"function",
@@ -46,7 +46,7 @@ for (const event of ["input", "before_agent_start"]) {
 // Hooks this extension deliberately does NOT register. These cover all
 // the boundaries that lock the scope: a stray registration on any of
 // these would break pi's native behaviour or change the contract.
-for (const event of ["user_bash", "tool_call", "tool_result"]) {
+for (const event of ["input", "user_bash", "tool_call", "tool_result"]) {
 	assert.equal(
 		handlers[event],
 		undefined,
@@ -57,84 +57,141 @@ for (const event of ["user_bash", "tool_call", "tool_result"]) {
 const ctx = { cwd: process.cwd() };
 
 // ---------------------------------------------------------------------------
-// input: `!cmd` anywhere in the typed message
+// message_end: `!cmd` after template / skill expansion
+// ---------------------------------------------------------------------------
+// The single expansion path for user input. Catches both directly-typed
+// `!cmd` (where the agent-session prompt flow lands the raw `!cmd` in
+// the user message because there is no longer an `input` hook to
+// rewrite it) and `!cmd` baked into a prompt-template / skill body
+// (where the body only materialises into the user message after
+// template expansion, so no pre-expansion hook could see it).
+// ---------------------------------------------------------------------------
+// message_end: post-template / post-skill user message
+// (Also covers the directly-typed case now that the `input` hook is
+// removed -- the unexpanded `!cmd` lands in the user message and is
+// expanded here, just like for a prompt template body.)
 // ---------------------------------------------------------------------------
 
-describe("input (`!cmd` anywhere in the typed message)", () => {
-	test("inline form substituted into the typed text", async () => {
-		const r = await handlers.input(
-			{ text: "check: !`echo MID`", source: "interactive" },
+describe("message_end (`!cmd` after template / skill expansion, or directly typed)", () => {
+	test("fenced form in a template-expanded user message is expanded", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "before\n!```sh\necho F\n```\nafter",
+						},
+					],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.equal(r.text, "check: MID");
+		assert.ok(r?.message, "message_end should return a replacement message");
+		const newText = r.message.content[0].text;
+		assert.equal(newText, "before\nF\nafter");
+		assert.doesNotMatch(newText, /!\`\`\`/);
 	});
 
-	test("fenced form substituted", async () => {
-		const r = await handlers.input(
-			{ text: "before\n!```sh\necho F\n```\nafter", source: "interactive" },
+	test("directly-typed inline form is also expanded (no separate `input` hook)", async () => {
+		// After the `input` hook was removed, a directly-typed `!`cmd``
+		// lands in the user message verbatim and is expanded by
+		// `message_end` in place. The LLM still sees the expanded text.
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "check: !`echo MID`" }],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.equal(r.text, "before\nF\nafter");
+		assert.equal(r.message.content[0].text, "check: MID");
 	});
 
-	test("fenced without language tag", async () => {
-		const r = await handlers.input(
-			{ text: "x !```\necho hi\n``` y", source: "interactive" },
+	test("text without `!` -- no-op", async () => {
+		// Plain text with no `!` is not a cmd-expand pattern; we leave it
+		// alone. (This is also what the post-`input`-expansion state used
+		// to look like before the hook was removed.)
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "result: X" }],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.equal(r.text, "x hi y");
+		assert.equal(r, undefined);
+	});
+
+	test("assistant message -- skipped (we only expand user messages)", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "!`echo SHOULD_NOT_RUN`" }],
+				},
+			},
+			ctx,
+		);
+		assert.equal(r, undefined);
+	});
+
+	test("toolResult message -- skipped", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "toolResult",
+					content: [{ type: "text", text: "!`echo SHOULD_NOT_RUN`" }],
+				},
+			},
+			ctx,
+		);
+		assert.equal(r, undefined);
+	});
+
+	test("image-only content -- skipped safely", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [
+						{ type: "image", data: "AAAA", mimeType: "image/png" },
+					],
+				},
+			},
+			ctx,
+		);
+		assert.equal(r, undefined);
 	});
 
 	test("multiple inline `!cmd` occurrences all replaced", async () => {
-		const r = await handlers.input(
-			{ text: "!`echo A` and !`echo B`", source: "interactive" },
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!`echo A` and !`echo B`" }],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.equal(r.text, "A and B");
+		assert.equal(r.message.content[0].text, "A and B");
 	});
 
-	test("inline inside a fenced body is NOT a separate match", async () => {
-		// `!`echo nested` inside the fenced body is just literal text,
-		// not a separate inline expansion.
-		const r = await handlers.input(
-			{ text: "!```sh\necho `echo nested`\n```", source: "interactive" },
-			ctx,
-		);
-		assert.equal(r.action, "transform");
-		// The fenced body should run as-is, producing whatever the inner
-		// command outputs. We just check the wrapper is gone.
-		assert.doesNotMatch(r.text, /!\`\`\`/);
-		assert.doesNotMatch(r.text, /```$/);
-	});
-
-	test("plain text without `!` -- no transform", async () => {
-		const r = await handlers.input({ text: "plain text", source: "interactive" }, ctx);
-		assert.equal(r, undefined);
-	});
-
-	test("text with `!` but no backticks -- no transform", async () => {
-		// `!ls` (no backticks) is NOT a cmd-expand pattern, so we leave it
-		// alone for pi's normal skill/template expansion to handle.
-		const r = await handlers.input({ text: "!ls", source: "interactive" }, ctx);
-		assert.equal(r, undefined);
-	});
-
-	test("non-interactive source (rpc, extension) skipped", async () => {
-		const r = await handlers.input({ text: "!`echo X`", source: "rpc" }, ctx);
-		assert.equal(r, undefined);
-	});
-
-	test("transform uses ctx.cwd", async () => {
-		const r = await handlers.input(
-			{ text: "cwd: !`pwd -P`", source: "interactive" },
-			ctx,
-		);
-		assert.equal(r.action, "transform");
-		assert.equal(r.text, "cwd: " + realpathSync(ctx.cwd));
+	test("replacement message preserves non-text fields (timestamp, id)", async () => {
+		const original = {
+			role: "user",
+			content: [{ type: "text", text: "!`echo keep-meta`" }],
+			timestamp: 1700000000000,
+			id: "msg-123",
+		};
+		const r = await handlers.message_end({ message: original }, ctx);
+		assert.equal(r.message.role, "user");
+		assert.equal(r.message.timestamp, 1700000000000);
+		assert.equal(r.message.id, "msg-123");
+		assert.equal(r.message.content[0].text, "keep-meta");
 	});
 });
 
@@ -199,37 +256,47 @@ describe("before_agent_start (context file expansion)", () => {
 // ---------------------------------------------------------------------------
 
 describe("truncation (output > 2000 bytes)", () => {
-	test("input transform: oversized command tail-truncated, full saved to temp file", async () => {
+	test("message_end: oversized command tail-truncated, full saved to temp file", async () => {
 		// Generate ~4 KB of output (well above the 2000-byte cap).
-		const r = await handlers.input(
-			{ text: "data: !`printf 'A%.0s' {1..4000}`", source: "interactive" },
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "data: !`printf 'A%.0s' {1..4000}`" }],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.match(r.text, /\[Output truncated/);
-		assert.doesNotMatch(r.text, /!\`/);
+		assert.ok(r?.message);
+		const out = r.message.content[0].text;
+		assert.match(out, /\[Output truncated/);
+		assert.doesNotMatch(out, /!\`/);
 		assert.ok(
-			r.text.length < 4000 + 200,
+			out.length < 4000 + 200,
 			"inline text must be smaller than the raw 4KB",
 		);
 		// The full output path is embedded in the truncation footer.
 		// (os.tmpdir() differs by platform -- `/tmp` on Linux, a
 		// per-user `/var/folders/.../T` on macOS, etc.)
-		const m = r.text.match(/Full output: (\S+pi-cmd-expand-[0-9a-f]+\.log)/);
+		const m = out.match(/Full output: (\S+pi-cmd-expand-[0-9a-f]+\.log)/);
 		assert.ok(m, "footer must include the temp file path");
 		const full = readFileSync(m[1], "utf-8");
 		assert.equal(full.length, 4000);
 		unlinkSync(m[1]);
 	});
 
-	test("input transform: small command not truncated", async () => {
-		const r = await handlers.input(
-			{ text: "data: !`echo tiny`", source: "interactive" },
+	test("message_end: small command not truncated", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "data: !`echo tiny`" }],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.equal(r.text, "data: tiny");
-		assert.doesNotMatch(r.text, /\[Output truncated/);
+		assert.equal(r.message.content[0].text, "data: tiny");
+		assert.doesNotMatch(r.message.content[0].text, /\[Output truncated/);
 	});
 
 	test("before_agent_start: oversized command gets truncation footer in system prompt", async () => {
@@ -262,15 +329,21 @@ describe("truncation (output > 2000 bytes)", () => {
 // ---------------------------------------------------------------------------
 
 describe("timeout (default 5 s)", () => {
-	test("slow input command times out and is reported inline, never throws", async () => {
-		const r = await handlers.input(
-			{ text: "wait: !`sleep 8 && echo DONE`", source: "interactive" },
+	test("slow message_end command times out and is reported inline, never throws", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "wait: !`sleep 8 && echo DONE`" }],
+				},
+			},
 			ctx,
 		);
-		assert.equal(r.action, "transform");
-		assert.doesNotMatch(r.text, /DONE/, "the 8s command must be killed before it can echo DONE");
-		assert.match(r.text, /command failed/);
-		assert.match(r.text, /timed out after 5000ms/);
+		assert.ok(r?.message);
+		const out = r.message.content[0].text;
+		assert.doesNotMatch(out, /DONE/, "the 8s command must be killed before it can echo DONE");
+		assert.match(out, /command failed/);
+		assert.match(out, /timed out after 5000ms/);
 	});
 });
 
@@ -307,5 +380,18 @@ describe("scope (the `!cmd` expansion is intentionally narrow)", () => {
 		// literally (e.g. `` !`ls` `` would fail as a real command).
 		assert.equal(handlers.tool_call, undefined);
 		assert.equal(handlers.tool_result, undefined);
+	});
+
+	test("input is not registered -- expansion is centralised in `message_end`", () => {
+		// We used to register an `input` handler that rewrote the typed
+		// text in place so the TUI would show the expanded output, but
+		// the contract was fragile (had to be paired with `message_end`
+		// for the prompt-template case anyway) and the TUI still could
+		// not show the expanded text for template-sourced input. With
+		// the hook removed, both directly-typed and template-sourced
+		// `!cmd` are expanded by the single `message_end` hook. The
+		// TUI trade-off is that the on-screen user message shows the
+		// raw `!`cmd`` form; the LLM still receives the expanded text.
+		assert.equal(handlers.input, undefined);
 	});
 });

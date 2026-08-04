@@ -1,5 +1,5 @@
 ---
-description: Test fenced `!```sh\n...\n``` ` form (input event path)
+description: Test fenced `!```sh\n...\n``` ` form — exercised via the `message_end` hook because this is a prompt template
 ---
 
 Run this multi-line command and tell me what it prints:
