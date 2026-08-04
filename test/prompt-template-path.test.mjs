@@ -32,19 +32,27 @@
  * real extension handler and asserts that the LLM-context messages
  * actually contain the expanded output.
  */
-import { describe, test } from "node:test";
+
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { describe, test } from "node:test";
 
 const require = createRequire(import.meta.url);
 const jitiMod = require("jiti");
 const jiti = jitiMod.default || jitiMod;
-const loader = jiti(import.meta.url, { moduleCache: false, interopDefault: true });
+const loader = jiti(import.meta.url, {
+	moduleCache: false,
+	interopDefault: true,
+});
 const extMod = await loader.import("../src/index.ts");
 const factory = extMod.default;
 
 const handlers = {};
-factory({ on(event, handler) { handlers[event] = handler; } });
+factory({
+	on(event, handler) {
+		handlers[event] = handler;
+	},
+});
 
 // Faithful replica of agent-session._replaceMessageInPlace (and
 // `extensionRunner.emitMessageEnd` returning a NEW replacement, which
@@ -70,7 +78,7 @@ async function emitMessageEndLikeRunner(event) {
 	return modified ? currentMessage : undefined;
 }
 
-const ctx = { cwd: process.cwd() };
+const _ctx = { cwd: process.cwd() };
 
 /**
  * Replay of the user-message code path:
@@ -101,7 +109,10 @@ async function replayPromptTemplatePath(userMessage, llmSink) {
 
 	// 1) processEvents side effect
 	// 2) listener: agent-session._handleAgentEvent
-	const replacement = await emitMessageEndLikeRunner({ type: "message_end", message: event.message });
+	const replacement = await emitMessageEndLikeRunner({
+		type: "message_end",
+		message: event.message,
+	});
 	if (replacement) {
 		const normalized =
 			(replacement.role === "user" ||
@@ -145,12 +156,16 @@ describe("user-message expansion path: LLM must see the expanded text, not the r
 		await replayPromptTemplatePath(userMessage, (llmCtx) => {
 			received = llmCtx;
 		});
-		const seen = received.messages.find((m) => m.role === "user")?.content?.[0]?.text;
+		const seen = received.messages.find((m) => m.role === "user")?.content?.[0]
+			?.text;
 		assert.ok(seen, "LLM context should still contain a user message");
-		assert.doesNotMatch(seen, /!\`\`\`/, "LLM must NOT see the raw !```sh block");
-		assert.match(seen, /== current user ==/);
-		assert.match(seen, /bytedance/);
-		assert.match(seen, /arm64/);
+		assert.doesNotMatch(seen, /!```/, "LLM must NOT see the raw !```sh block");
+		// Verify each fenced-block command actually ran by asserting the
+		// header is followed by a non-empty value. We intentionally do
+		// not match a specific user/architecture string — the test must
+		// pass on any environment (macOS dev box, Linux CI runner, …).
+		assert.match(seen, /== current user ==\n\S+/);
+		assert.match(seen, /== uname ==\n\S+/);
 	});
 
 	test("inline form: LLM receives the command output", async () => {

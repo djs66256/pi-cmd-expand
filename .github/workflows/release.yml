@@ -6,49 +6,45 @@ on:
     tags:
       - 'v*'
 
-# Allow manual runs for re-publishing or dry-runs; `inputs.tag` is unused but
-# the workflow_dispatch trigger makes it easy to debug.
+  # Allow manual re-runs for re-publishing or dry-runs.
   workflow_dispatch:
 
+# Serialize releases so a re-pushed tag can never race the publish
+# of the first push. `cancel-in-progress: false` so an in-flight
+# publish is never killed by a follow-up tag push (publishes are
+# not safe to interrupt mid-flight).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run tests
-        run: npm test
-
-      - name: Biome check
-        run: npx biome check .
-
   publish:
-    name: publish to npm
-    needs: test
+    name: Publish to npm
     runs-on: ubuntu-latest
     # `id-token: write` is required for `npm publish --provenance`
-    # (OIDC trusted publishing). `contents: write` lets us create a
-    # GitHub release below.
+    # (OIDC trusted publishing). `contents: write` lets the
+    # `softprops/action-gh-release` step below create the GitHub
+    # release for this tag.
     permissions:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: https://registry.npmjs.org/
           cache: npm
+          registry-url: https://registry.npmjs.org/
+
+      - name: Upgrade npm (for OIDC support)
+        # Trusted Publishing requires npm >= 11.4. Node 22 ships with
+        # npm 10.x, so we upgrade to the latest 11.x line. Pin to ^11
+        # so a future npm 12 major doesn't break the workflow
+        # without an explicit bump.
+        run: npm install -g npm@^11
 
       - name: Install dependencies
         run: npm ci
@@ -65,17 +61,26 @@ jobs:
           fi
           echo "Releasing ${PKG_VERSION}"
 
+      - name: Typecheck / lint
+        run: npx biome check .
+
+      - name: Test
+        run: npm test
+
       - name: Publish to npm
-        # Trusted publishing via OIDC: the GitHub Actions OIDC token
-        # is exchanged for an npm publish token at publish time, so no
-        # long-lived `NPM_TOKEN` secret is required. Requires:
-        #   1. `id-token: write` permission above.
-        #   2. Trusted-publisher config on npmjs.com pointing at this
-        #      repo + workflow file (one-time, in package settings).
-        # `--provenance` attaches an SLSA-style build provenance
-        # attestation to the published tarball.
-        # The package is unscoped, so it is public by default;
-        # `--access public` is explicit for clarity.
+        # Trusted Publishing: with no NODE_AUTH_TOKEN set, npm requests
+        # an OIDC token from the runner (needs `id-token: write` above)
+        # and presents it to the registry. The registry validates the
+        # token against the Trusted Publisher config on npmjs.com.
+        #
+        # `--provenance` attaches an npm attestation linking the
+        # published tarball back to this workflow run. Requires
+        # npm 11.4+ — see the "Upgrade npm" step above.
+        #
+        # `--access public` is the default for unscoped packages
+        # but is stated explicitly so the intent is obvious in the
+        # log. `prepublishOnly` in package.json already ran `test`
+        # before this step, so we don't need to repeat it here.
         run: npm publish --provenance --access public
 
       - name: Create GitHub release

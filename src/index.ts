@@ -40,14 +40,14 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { writeFile } from "node:fs/promises";
 import { promises as fs } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createLocalBashOperations,
-	formatSize,
 	type ExtensionAPI,
+	formatSize,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
 
@@ -77,7 +77,7 @@ function findCommandMatches(text: string): CommandMatch[] {
 
 	// Fenced form: !```lang\ncmd\n```  (lang is optional)
 	// The body must not itself contain a closing ``` on its own line.
-	const fencedRe = /!```([a-zA-Z0-9_+\-]*)\n([\s\S]*?)\n```/g;
+	const fencedRe = /!```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
 	for (const m of text.matchAll(fencedRe)) {
 		matches.push({
 			start: m.index ?? 0,
@@ -113,7 +113,8 @@ function describeExecError(err: unknown, timeoutMs: number): string {
 	// caller sees the same unit it configured.
 	if (err.message.startsWith("timeout:")) {
 		const secs = Number(err.message.slice("timeout:".length));
-		if (Number.isFinite(secs)) return `timed out after ${Math.round(secs * 1000)}ms`;
+		if (Number.isFinite(secs))
+			return `timed out after ${Math.round(secs * 1000)}ms`;
 		return `timed out after ${timeoutMs}ms`;
 	}
 	// `bashOps.exec` also throws when the working directory does not
@@ -126,7 +127,10 @@ function describeExecError(err: unknown, timeoutMs: number): string {
 
 /** Persist `fullOutput` to a temp file and return its absolute path. */
 async function writeFullOutput(fullOutput: string): Promise<string> {
-	const path = join(tmpdir(), `pi-cmd-expand-${randomBytes(8).toString("hex")}.log`);
+	const path = join(
+		tmpdir(),
+		`pi-cmd-expand-${randomBytes(8).toString("hex")}.log`,
+	);
 	await writeFile(path, fullOutput, "utf-8");
 	return path;
 }
@@ -142,7 +146,11 @@ async function writeFullOutput(fullOutput: string): Promise<string> {
  * resolution, ANSI/binary sanitization, and process-tree cleanup for
  * free.
  */
-async function runCommand(command: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
+async function runCommand(
+	command: string,
+	cwd: string,
+	timeoutMs: number,
+): Promise<CommandResult> {
 	const chunks: Buffer[] = [];
 	let exitCode: number | null = 0;
 
@@ -202,7 +210,11 @@ async function runCommand(command: string, cwd: string, timeoutMs: number): Prom
  * replacement text already includes any truncation footer (with the
  * temp-file path) so the LLM sees the full provenance inline.
  */
-async function expandText(text: string, cwd: string, timeoutMs: number): Promise<string> {
+async function expandText(
+	text: string,
+	cwd: string,
+	timeoutMs: number,
+): Promise<string> {
 	const matches = findCommandMatches(text);
 	if (matches.length === 0) return text;
 
@@ -217,7 +229,10 @@ async function expandText(text: string, cwd: string, timeoutMs: number): Promise
 }
 
 /** Per-file expansion cache keyed by absolute path. */
-const expansionCache = new Map<string, { mtimeMs: number; size: number; expanded: string }>();
+const expansionCache = new Map<
+	string,
+	{ mtimeMs: number; size: number; expanded: string }
+>();
 
 async function expandFile(
 	filePath: string,
@@ -266,7 +281,9 @@ function extractUserText(content: unknown): string {
 	return content
 		.filter(
 			(block): block is { type: string; text?: string } =>
-				typeof block === "object" && block !== null && (block as { type?: unknown }).type === "text",
+				typeof block === "object" &&
+				block !== null &&
+				(block as { type?: unknown }).type === "text",
 		)
 		.map((block) => block.text ?? "")
 		.join("\n");
@@ -327,7 +344,7 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "user") return;
 		const text = extractUserText(event.message.content);
-		if (!text || !text.includes("!")) return;
+		if (!text?.includes("!")) return;
 
 		const expanded = await expandText(text, ctx.cwd, timeoutMs);
 		if (expanded === text) return;
@@ -356,10 +373,20 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 
 		for (const file of contextFiles) {
 			if (!file.content.includes("!")) continue;
-			const expanded = await expandFile(file.path, file.content, ctx.cwd, timeoutMs);
+			const expanded = await expandFile(
+				file.path,
+				file.content,
+				ctx.cwd,
+				timeoutMs,
+			);
 			if (expanded === file.content) continue;
 
-			const next = substituteInSystemPrompt(systemPrompt, file.path, file.content, expanded);
+			const next = substituteInSystemPrompt(
+				systemPrompt,
+				file.path,
+				file.content,
+				expanded,
+			);
 			if (next !== systemPrompt) {
 				systemPrompt = next;
 				changed = true;

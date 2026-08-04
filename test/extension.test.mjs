@@ -8,31 +8,42 @@
  * file, so we load it through jiti (already a devDep) and exercise
  * each event handler with a hand-built ExtensionAPI stub.
  */
-import { describe, test } from "node:test";
+
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import {
 	mkdtempSync,
 	readFileSync,
-	realpathSync,
 	rmSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describe, test } from "node:test";
 
 const require = createRequire(import.meta.url);
 const jitiMod = require("jiti");
 const jiti = jitiMod.default || jitiMod;
-const loader = jiti(import.meta.url, { moduleCache: false, interopDefault: true });
+const loader = jiti(import.meta.url, {
+	moduleCache: false,
+	interopDefault: true,
+});
 
 const extMod = await loader.import("../src/index.ts");
 const factory = extMod.default;
-assert.equal(typeof factory, "function", "src/index.ts must default-export a factory function");
+assert.equal(
+	typeof factory,
+	"function",
+	"src/index.ts must default-export a factory function",
+);
 
 const handlers = {};
-factory({ on(event, handler) { handlers[event] = handler; } });
+factory({
+	on(event, handler) {
+		handlers[event] = handler;
+	},
+});
 
 // Hooks this extension DOES register (expansion paths).
 for (const event of ["message_end", "before_agent_start"]) {
@@ -91,7 +102,7 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 		assert.ok(r?.message, "message_end should return a replacement message");
 		const newText = r.message.content[0].text;
 		assert.equal(newText, "before\nF\nafter");
-		assert.doesNotMatch(newText, /!\`\`\`/);
+		assert.doesNotMatch(newText, /!```/);
 	});
 
 	test("directly-typed inline form is also expanded (no separate `input` hook)", async () => {
@@ -157,9 +168,7 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 			{
 				message: {
 					role: "user",
-					content: [
-						{ type: "image", data: "AAAA", mimeType: "image/png" },
-					],
+					content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
 				},
 			},
 			ctx,
@@ -210,13 +219,15 @@ describe("before_agent_start (context file expansion)", () => {
 			const r = await handlers.before_agent_start(
 				{
 					systemPrompt: sys,
-					systemPromptOptions: { contextFiles: [{ path: file, content: original }] },
+					systemPromptOptions: {
+						contextFiles: [{ path: file, content: original }],
+					},
 				},
 				ctx,
 			);
 			assert.match(r.systemPrompt, /alpha/);
 			assert.match(r.systemPrompt, /beta/);
-			assert.doesNotMatch(r.systemPrompt, /!\`/);
+			assert.doesNotMatch(r.systemPrompt, /!`/);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -240,11 +251,17 @@ describe("before_agent_start (context file expansion)", () => {
 			const r = await handlers.before_agent_start(
 				{
 					systemPrompt: sys,
-					systemPromptOptions: { contextFiles: [{ path: file, content: original }] },
+					systemPromptOptions: {
+						contextFiles: [{ path: file, content: original }],
+					},
 				},
 				ctx,
 			);
-			assert.equal(r, undefined, "should not change systemPrompt when no `!` is present");
+			assert.equal(
+				r,
+				undefined,
+				"should not change systemPrompt when no `!` is present",
+			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -262,7 +279,9 @@ describe("truncation (output > 2000 bytes)", () => {
 			{
 				message: {
 					role: "user",
-					content: [{ type: "text", text: "data: !`printf 'A%.0s' {1..4000}`" }],
+					content: [
+						{ type: "text", text: "data: !`printf 'A%.0s' {1..4000}`" },
+					],
 				},
 			},
 			ctx,
@@ -270,7 +289,7 @@ describe("truncation (output > 2000 bytes)", () => {
 		assert.ok(r?.message);
 		const out = r.message.content[0].text;
 		assert.match(out, /\[Output truncated/);
-		assert.doesNotMatch(out, /!\`/);
+		assert.doesNotMatch(out, /!`/);
 		assert.ok(
 			out.length < 4000 + 200,
 			"inline text must be smaller than the raw 4KB",
@@ -309,14 +328,18 @@ describe("truncation (output > 2000 bytes)", () => {
 			const r = await handlers.before_agent_start(
 				{
 					systemPrompt: sys,
-					systemPromptOptions: { contextFiles: [{ path: file, content: original }] },
+					systemPromptOptions: {
+						contextFiles: [{ path: file, content: original }],
+					},
 				},
 				ctx,
 			);
 			assert.match(r.systemPrompt, /\[Output truncated/);
-			assert.doesNotMatch(r.systemPrompt, /!\`/);
+			assert.doesNotMatch(r.systemPrompt, /!`/);
 			// Temp file path is platform-dependent (see note above).
-			const m = r.systemPrompt.match(/Full output: (\S+pi-cmd-expand-[0-9a-f]+\.log)/);
+			const m = r.systemPrompt.match(
+				/Full output: (\S+pi-cmd-expand-[0-9a-f]+\.log)/,
+			);
 			if (m) unlinkSync(m[1]);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
@@ -341,7 +364,11 @@ describe("timeout (default 5 s)", () => {
 		);
 		assert.ok(r?.message);
 		const out = r.message.content[0].text;
-		assert.doesNotMatch(out, /DONE/, "the 8s command must be killed before it can echo DONE");
+		assert.doesNotMatch(
+			out,
+			/DONE/,
+			"the 8s command must be killed before it can echo DONE",
+		);
 		assert.match(out, /command failed/);
 		assert.match(out, /timed out after 5000ms/);
 	});
