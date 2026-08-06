@@ -11,6 +11,7 @@
 
 import assert from "node:assert/strict";
 import {
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	rmSync,
@@ -46,7 +47,7 @@ factory({
 });
 
 // Hooks this extension DOES register (expansion paths).
-for (const event of ["message_end", "before_agent_start"]) {
+for (const event of ["message_end", "before_agent_start", "session_start"]) {
 	assert.equal(
 		typeof handlers[event],
 		"function",
@@ -64,6 +65,20 @@ for (const event of ["input", "user_bash", "tool_call", "tool_result"]) {
 		`${event} handler must NOT be registered -- see "What is NOT expanded" in the README`,
 	);
 }
+
+// Point `getAgentDir()` at a clean temp dir so any real config file
+// under `~/.pi/agent/pi-cmd-expand.json` on the test host can't leak
+// into the suite. We restore the previous value (if any) in a final
+// hook so subprocesses started by `npm test` don't see a stale env.
+const globalAgentDir = mkdtempSync(join(tmpdir(), "pi-cmd-expand-agentdir-"));
+process.env.PI_CODING_AGENT_DIR = globalAgentDir;
+process.on("exit", () => {
+	try {
+		rmSync(globalAgentDir, { recursive: true, force: true });
+	} catch {
+		// Best-effort; the OS will reclaim tmp files on reboot.
+	}
+});
 
 const ctx = { cwd: process.cwd() };
 
@@ -1358,6 +1373,400 @@ describe("before_agent_start (context file `@`path` expansion)", () => {
 				ctx,
 			);
 			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Config: `pi-cmd-expand.json` toggles for `enableCmd` and `enableFile`
+// ---------------------------------------------------------------------------
+// Read on `session_start`. Missing / invalid config falls back to
+// defaults (both features enabled). The two kinds are gated
+// independently — disabling cmd leaves `@` files intact, and vice-
+// versa. Disabling cmd also stops recursive `` !`cmd` `` execution
+// inside loaded files (same gate applies at every expansion level).
+// ---------------------------------------------------------------------------
+
+describe("config (`enableCmd` / `enableFile` toggles)", () => {
+	/** Initialise `currentConfig` for a `cwd` by invoking the
+	 *  `session_start` handler with that cwd. Returns the parsed
+	 *  config that the loader produced so tests can sanity-check
+	 *  the round-trip. */
+	async function startSessionIn(cwd) {
+		return handlers.session_start({}, { cwd });
+	}
+
+	/** Write a config under `<tmp>/.pi/pi-cmd-expand.json`. The
+	 *  parent directory may not exist yet (fresh mkdtemp output),
+	 *  so we mkdir it explicitly before writeFileSync. */
+	function writeProjectConfig(tmp, body) {
+		const piDir = join(tmp, ".pi");
+		mkdirSync(piDir, { recursive: true });
+		writeFileSync(join(piDir, "pi-cmd-expand.json"), body);
+	}
+
+	test("default behaviour with no config file -- both kinds expand", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			const inner = join(tmp, "default-keep.md");
+			writeFileSync(inner, "FILE-DEFAULT-CONTENT");
+			await startSessionIn(tmp);
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `!\`echo CMD\` and @\`${inner}\``,
+							},
+						],
+					},
+				},
+				{ cwd: tmp },
+			);
+			// Both forms expanded (cmd ran, file loaded).
+			assert.match(
+				r.message.content[0].text,
+				/<cmd source="echo CMD">CMD<\/cmd>/,
+			);
+			assert.match(
+				r.message.content[0].text,
+				new RegExp(
+					`<file path="${inner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}">`,
+				),
+			);
+			assert.match(r.message.content[0].text, /FILE-DEFAULT-CONTENT/);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("enableCmd=false: `` !`cmd` `` left as literal text in user message", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(tmp, JSON.stringify({ enableCmd: false }));
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "raw: !`echo SHOULD_NOT_RUN`" }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			// The handler short-circuits when no enabled trigger char
+			// is present, so it returns `undefined` and the LLM sees
+			// the original text unchanged.
+			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("enableCmd=false: file expansion still works alongside disabled cmd", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			const inner = join(tmp, "kept.md");
+			writeFileSync(inner, "KEPT-FILE-CONTENT");
+			writeProjectConfig(tmp, JSON.stringify({ enableCmd: false }));
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: `cmd: !\`echo NOPE\` file: @\`${inner}\`` },
+						],
+					},
+				},
+				{ cwd: tmp },
+			);
+			// `` !`echo NOPE` `` stays literal (would fail as a real shell
+			// command), but `` @`...` `` still loads the file.
+			assert.match(r.message.content[0].text, /!`echo NOPE`/);
+			assert.match(r.message.content[0].text, /<file path=/);
+			assert.match(r.message.content[0].text, /KEPT-FILE-CONTENT/);
+			assert.doesNotMatch(r.message.content[0].text, /<cmd /);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("enableFile=false: `` @`path` `` left as literal text in user message", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			const inner = join(tmp, "ignored.md");
+			writeFileSync(inner, "IGNORED");
+			writeProjectConfig(tmp, JSON.stringify({ enableFile: false }));
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `see: @\`${inner}\` here` }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			// `@` is a disabled trigger char, so the handler short-circuits
+			// and returns `undefined` (no expansion at all).
+			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("enableFile=false: cmd expansion still works alongside disabled file", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(tmp, JSON.stringify({ enableFile: false }));
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "ping: !`echo STILL_RUNS`" }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			assert.equal(
+				r.message.content[0].text,
+				'ping: <cmd source="echo STILL_RUNS">STILL_RUNS</cmd>',
+			);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("both toggles off: any trigger syntax is left literal", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(
+				tmp,
+				JSON.stringify({ enableCmd: false, enableFile: false }),
+			);
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "!`echo X` and @`./whatever.md`",
+							},
+						],
+					},
+				},
+				{ cwd: tmp },
+			);
+			// Both trigger chars present, but neither kind is enabled —
+			// short-circuit on the fast-path, no replacement returned.
+			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("enableCmd=false disables recursion: !cmd inside a loaded file is left literal", async () => {
+		// Even when the file is loaded via `@`, the nested `` !`cmd` `` must
+		// stay literal because the gate applies at every expansion level.
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			const inner = join(tmp, "inner.md");
+			writeFileSync(inner, "header\n!`echo NESTED`\nfooter");
+			writeProjectConfig(tmp, JSON.stringify({ enableCmd: false }));
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `load: @\`${inner}\`` }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			const out = r.message.content[0].text;
+			// File expanded (enableFile=true), but the nested cmd syntax
+			// is preserved verbatim — the LLM sees `` !`echo NESTED` ``.
+			assert.match(out, /header/);
+			assert.match(out, /footer/);
+			assert.match(out, /!`echo NESTED`/);
+			assert.doesNotMatch(out, /<cmd /);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("config precedence: project overrides global", async () => {
+		// Write both files: global sets enableCmd=false, project
+		// sets enableFile=false. Each level only sees its own setting.
+		writeFileSync(
+			join(globalAgentDir, "pi-cmd-expand.json"),
+			JSON.stringify({ enableCmd: false }),
+		);
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(tmp, JSON.stringify({ enableFile: false }));
+			await startSessionIn(tmp);
+
+			// With BOTH settings merged, neither kind expands.
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: "!`echo BOTH_OFF` @`/etc/hostname`" },
+						],
+					},
+				},
+				{ cwd: tmp },
+			);
+			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+			unlinkSync(join(globalAgentDir, "pi-cmd-expand.json"));
+		}
+	});
+
+	test("invalid project config falls back to defaults (no throw)", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			// Garbage JSON. The loader logs and returns DEFAULT_CONFIG.
+			writeProjectConfig(tmp, "{ this is not valid json :: !!");
+			await startSessionIn(tmp);
+
+			// Both kinds should still expand.
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "!`echo DEFAULTS`" }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			assert.equal(
+				r.message.content[0].text,
+				'<cmd source="echo DEFAULTS">DEFAULTS</cmd>',
+			);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("wrong-typed values in config are ignored (lenient schema)", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			// `enableCmd` is a string (truthy non-bool) — ignored.
+			// `enableFile` is `null` — ignored. Both should default to `true`.
+			writeProjectConfig(
+				tmp,
+				JSON.stringify({ enableCmd: "false", enableFile: null }),
+			);
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "!`echo KEPT`" }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			assert.equal(
+				r.message.content[0].text,
+				'<cmd source="echo KEPT">KEPT</cmd>',
+			);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("unknown keys in config are ignored", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(
+				tmp,
+				JSON.stringify({
+					enableCmd: false,
+					// Unknown future-proofing keys should not break loading.
+					enableBash: true,
+					maxOutputBytes: 5000,
+					theme: "dark",
+				}),
+			);
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "!`echo X`" }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("config also gates before_agent_start context-file expansion", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(tmp, JSON.stringify({ enableCmd: false }));
+			await startSessionIn(tmp);
+
+			const file = join(tmp, "AGENTS.md");
+			const original = "task: !`echo SHOULD_NOT_RUN`";
+			writeFileSync(file, original);
+			const sys = `<project_instructions path="${file}">\n${original}\n</project_instructions>`;
+			const r = await handlers.before_agent_start(
+				{
+					systemPrompt: sys,
+					systemPromptOptions: {
+						contextFiles: [{ path: file, content: original }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			// enableCmd is off, so the system prompt must be unchanged.
+			assert.equal(r, undefined);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("non-JSON top-level (e.g. an array) is ignored -- defaults apply", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-cfg-"));
+		try {
+			writeProjectConfig(tmp, JSON.stringify([1, 2, 3]));
+			await startSessionIn(tmp);
+
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "!`echo OK`" }],
+					},
+				},
+				{ cwd: tmp },
+			);
+			assert.equal(r.message.content[0].text, '<cmd source="echo OK">OK</cmd>');
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}

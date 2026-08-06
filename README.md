@@ -29,21 +29,21 @@ execution. For `@``` ` the tag is ignored entirely.
 
 ## What it does
 
-- **`` `!`cmd` ``** anywhere in your typed message → the command runs in the
+- **`` !`cmd` ``** anywhere in your typed message → the command runs in the
   agent's current working directory, and the output is wrapped in
   `<cmd source="…">…</cmd>` before the agent sees the message.
-- **`` `@`path` ``** anywhere in your typed message → the file's UTF-8
+- **`` @`path` ``** anywhere in your typed message → the file's UTF-8
   contents are wrapped in `<file path="…">…</file>` and inlined. The
   path is resolved against the agent's cwd; absolute paths are used
   verbatim.
-- **`` `!`cmd` ``** / **`` `@`path` ``** inside `AGENTS.md` / `CLAUDE.md` →
+- **`` !`cmd` ``** / **`` @`path` ``** inside `AGENTS.md` / `CLAUDE.md` →
   the same expansion happens at session start, so project-context files
   can include live filesystem snapshots, package lists, diffs, **and
   inlined source files**.
-- **Recursion** — a file loaded via `` `@`path` `` is itself run through
-  the same expansion rules, so any further `` `@`path` `` or `` `!`cmd` ``
+- **Recursion** — a file loaded via `` @`path` `` is itself run through
+  the same expansion rules, so any further `` @`path` `` or `` !`cmd` ``
   inside it is also resolved (depth-capped at 10; cycles short-circuited
-  inline). This means a single `` `@`./README.md` `` can pull in a whole
+  inline). This means a single `` @`./README.md` `` can pull in a whole
   doc tree in one go.
 
 Every expansion is wrapped in a semantic tag (`<cmd>` or `<file>`) with
@@ -110,7 +110,7 @@ Sibling docs:
 
 …when pi loads it, the agent sees the real filesystem snapshot (taken in
 the agent's cwd), the full contents of `src/index.ts` (recursively
-expanded if it itself contains `` `@`path` `` / `` `!`cmd` ``), and both
+expanded if it itself contains `` @`path` `` / `` !`cmd` ``), and both
 `README.md` and `CHANGELOG.md` — each in its own `<file>` wrap.
 
 Inline (one file):
@@ -126,19 +126,59 @@ Fenced (multi-file, one wrap per file):
 <file path="./CHANGELOG.md">…</file>
 ```
 
+## Configuration
+
+Both kinds of expansion can be turned on or off independently via a
+JSON config file. The two locations (project overrides global on a
+per-key basis):
+
+| Location                            | Scope                  |
+| ----------------------------------- | ---------------------- |
+| `~/.pi/agent/pi-cmd-expand.json`    | Global (all projects)  |
+| `./.pi/pi-cmd-expand.json`          | Project (this cwd)     |
+
+Schema — all keys optional, missing / wrong-typed / unknown keys fall
+back to defaults without throwing:
+
+```json
+{
+  "enableCmd": true,
+  "enableFile": true
+}
+```
+
+| Key           | Default | Effect                                                                                                              |
+| ------------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| `enableCmd`   | `true`  | When `false`, `` !`cmd` `` / `` !```sh ` blocks are left as literal text in user messages and `AGENTS.md` / `CLAUDE.md`. The toggle applies at every expansion level, so `` !`cmd` `` inside a loaded file is also left literal. |
+| `enableFile`  | `true`  | When `false`, `` @`path` `` / `` @``` ` blocks are left as literal text in both user messages and context files. Same recursive semantics. |
+
+The file is read on session start (and again on `/reload`). Mid-session
+edits without `/reload` take effect on the next session. Parse errors
+are logged and ignored — defaults apply.
+
+Use cases:
+
+- **Disable cmd only**, keep `@`-files: leave commands as literal text
+  the LLM can read (and decide to run with the built-in `bash` tool,
+  preserving any safety affordances you've set up there), but still
+  inline context files.
+- **Disable file only**, keep `!`-cmds: pre-compute command snapshots
+  in a prompt template, but stop the extension from reading any file
+  the prompt references. Useful for tightly-controlled environments.
+
 ## Scope
 
 The expansion rule is intentionally narrow:
 
 | Source                                            | Expanded?            |
 | ------------------------------------------------- | -------------------- |
-|  `` `!`cmd` ``  / `` `@`path` ``  in a directly-typed message   | ✅ `message_end` (LLM only — the on-screen chat bubble shows the raw form because pi does not re-render the user message on `message_end`) |
-|  `` `!`cmd` ``  / `` `@`path` ``  inside a prompt template (`/foo`) or skill body | ✅ `message_end` (post-template expansion) |
-|  `` `!`cmd` ``  / `` `@`path` ``  in `AGENTS.md` / `CLAUDE.md`             | ✅ `before_agent_start` |
-| `` `@`path` ``  chained inside a file loaded via `` `@`path` `` | ✅ recursive expansion (depth-capped at 10) |
+|  `` !`cmd` ``  / `` @`path` ``  in a directly-typed message   | ✅ `message_end` (LLM only — the on-screen chat bubble shows the raw form because pi does not re-render the user message on `message_end`) |
+|  `` !`cmd` ``  / `` @`path` ``  inside a prompt template (`/foo`) or skill body | ✅ `message_end` (post-template expansion) |
+|  `` !`cmd` ``  / `` @`path` ``  in `AGENTS.md` / `CLAUDE.md`             | ✅ `before_agent_start` |
+| `` @`path` ``  chained inside a file loaded via `` @`path` `` | ✅ recursive expansion (depth-capped at 10) |
 | `!cmd` at the start of a line                     | ❌ pi's native `!bash` |
 | Commands the LLM runs via its `bash` tool         | ❌ untouched         |
-| Files the agent reads with `read`                 | ❌ only files explicitly referenced via `` `@`path` `` |
+| Files the agent reads with `read`                 | ❌ only files explicitly referenced via `` @`path` `` |
 
 The `input` / `user_bash` / `tool_call` / `tool_result` hooks are
 deliberately left unregistered: `input` because the on-screen TUI
@@ -153,7 +193,7 @@ the agent's own `bash` tool is not pre- or post-processed.
 > *after* template / skill expansion but *before* the LLM call
 > (see [docs/extensions.md](https://pi.dev/docs/extensions#message_end)),
 > so the user message it sees already contains the
-> `` `!`cmd` `` form whether the user typed it directly or it came
+> `` !`cmd` `` form whether the user typed it directly or it came
 > from a prompt-template / skill body. Rewriting it in place inside
 > `message_end` covers both cases with a single path. See
 > [AGENTS.md](./AGENTS.md) for the full rationale.
@@ -182,9 +222,9 @@ the agent's own `bash` tool is not pre- or post-processed.
   `[command failed: exit code N]` inside the wrap (with stdout/stderr
   above it when present); a missing file becomes
   `[file failed: ENOENT: no such file or directory, open '/abs/path']`
-  inside the wrap; a circular `` `@`path` `` chain becomes
+  inside the wrap; a circular `` @`path` `` chain becomes
   `[file skipped: circular reference: ./foo.md]` inside the wrap. The
-  expansion never throws, so a broken  `` `!`cmd` ``  or  `` `@`path` ``
+  expansion never throws, so a broken  `` !`cmd` ``  or  `` @`path` ``
   never aborts a turn.
 - **Truncation** — command output over 2 KB is tail-truncated in
   place; file content over 10 KB is tail-truncated in place. In both
@@ -193,7 +233,7 @@ the agent's own `bash` tool is not pre- or post-processed.
   `[Output truncated ... Full output: <path>]`, inside the wrap so
   the LLM can read it on demand. Failed commands bypass truncation
   so the diagnostic is preserved.
-- **Recursion** — a file loaded via `` `@`path` `` is run through
+- **Recursion** — a file loaded via `` @`path` `` is run through
   the same expansion pipeline as the top-level text, up to a depth
   cap of 10. Cycles are short-circuited with a per-chain visited
   set. The depth cap is a safety net; in normal use, depth 1–3 is
@@ -203,7 +243,7 @@ the agent's own `bash` tool is not pre- or post-processed.
 - **Caching** — context-file expansions are cached by
   `path + mtime + size` within a session, so multi-turn sessions
   don't re-run the same commands or re-read the same referenced
-  files every turn. Files loaded via `` `@`path` `` inside a
+  files every turn. Files loaded via `` @`path` `` inside a
   context file are NOT individually cached — they're cached as part
   of the containing file's expansion result, and re-read whenever
   the containing file changes.
@@ -221,10 +261,10 @@ the agent's own `bash` tool is not pre- or post-processed.
   truncated to ≤ 20 characters (first line of fenced body, with
   `...` indicating further truncation). Long commands stay
   executable; only the visible provenance is short.
-- **Email safety** — the inline `` `@`path` `` regex uses a
+- **Email safety** — the inline `` @`path` `` regex uses a
   `(?<!\w)` lookbehind so email-like text such as
-  `user@`example.com`` is NOT matched. `` `@` `` after a word
-  character (alphanumeric / `_`) is left alone; `` `@` `` at
+  `user@`example.com`` is NOT matched. `` @` `` after a word
+  character (alphanumeric / `_`) is left alone; `` @` `` at
   start-of-string, after whitespace, or after punctuation still
   triggers file loading.
 

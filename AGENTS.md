@@ -13,9 +13,9 @@ and file-reference syntax in prompts and project context files
 before the agent sees them. Four forms are supported, all Claude
 Code–compatible:
 
--  `` `!`cmd` ``  (inline command)
+-  `` !`cmd` ``  (inline command)
 - `!```lang\ncmd\n```\n` (fenced command; language tag is optional)
-- `` `@`path/to/file` ``  (inline file reference; backtick-delimited
+- `` @`path/to/file` ``  (inline file reference; backtick-delimited
   so paths with spaces work)
 - `@```lang\npath1\npath2\n```\n` (fenced file reference; one or
   more paths, language tag is optional and ignored)
@@ -23,11 +23,11 @@ Code–compatible:
 Inline file references resolve to a single file's content; fenced
 file references resolve to one or more files, each in its own
 `<file path="…">…</file>` wrap. Both forms recursively expand any
-further `` `@`path` `` / `` `!`cmd` `` / `!```...```` / `@```...````
+further `` @`path` `` / `` !`cmd` `` / `!```...```` / `@```...````
 found inside the loaded file, up to a depth cap of 10.
 
 Single TypeScript file (`src/index.ts`), default-exports a factory,
-registers two event handlers, nothing else.
+registers three event handlers, nothing else.
 
 ## Repository layout
 
@@ -67,10 +67,11 @@ dep, so invoke via `npx biome`.
 
 | Event                | What it does                                                                                                                                                                                                          |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `message_end`        | Rewrites `!`cmd`` / `` @`path` `` / their fenced forms in the final user message (post-template / post-skill expansion) in place before the LLM call. The same path covers both directly-typed and template-sourced input — there is no earlier hook that can see template bodies. |
-| `before_agent_start` | Walks `event.systemPromptOptions.contextFiles`, expands each `AGENTS.md` / `CLAUDE.md` block (with both `!`cmd`` and `` @`path` `` resolved, recursively), and substitutes the expanded content into the system prompt's `<project_instructions path="…">` block. This is the only pi event that exposes both the system prompt string AND the structured `contextFiles` list. |
+| `message_end`        | Rewrites `!`cmd`` / `` @`path` `` / their fenced forms in the final user message (post-template / post-skill expansion) in place before the LLM call. The same path covers both directly-typed and template-sourced input — there is no earlier hook that can see template bodies. Honours `enableCmd` / `enableFile` from the config. |
+| `before_agent_start` | Walks `event.systemPromptOptions.contextFiles`, expands each `AGENTS.md` / `CLAUDE.md` block (with both `!`cmd`` and `` @`path` `` resolved, recursively), and substitutes the expanded content into the system prompt's `<project_instructions path="…">` block. This is the only pi event that exposes both the system prompt string AND the structured `contextFiles` list. Honours `enableCmd` / `enableFile` from the config. |
+| `session_start`      | Reads `pi-cmd-expand.json` from the agent dir (`~/.pi/agent/pi-cmd-expand.json`) and from the project dir (`./.pi/pi-cmd-expand.json`), merges them (project wins on a per-key basis), and stores the result in module-level `currentConfig`. Runs once per session start and again on `/reload`. Mid-session edits without `/reload` take effect on the next session. |
 
-### Data flow (per  `` `!`cmd` ``  /  `` `@`path` ``  occurrence)
+### Data flow (per  `` !`cmd` ``  /  `` @`path` ``  occurrence)
 
 ```
 extractUserText(event.message.content)
@@ -114,14 +115,14 @@ re-execute) and `substituteInSystemPrompt()` (regex-substitutes the
 
 ### Recursion in detail
 
-A file loaded via `` `@`path` `` is run through the same expansion
+A file loaded via `` @`path` `` is run through the same expansion
 pipeline as the top-level text. This is what lets a single
-`` `@`./CLAUDE.md` `` pull in a whole doc tree.
+`` @`./CLAUDE.md` `` pull in a whole doc tree.
 
 Three guards keep this safe:
 
 1. **Depth cap (`MAX_RECURSION_DEPTH = 10`).** Beyond the cap,
-   `expandText` returns the file content with whatever `` `@`path` ``
+   `expandText` returns the file content with whatever `` @`path` ``
    references it still contains unexpanded. The LLM sees the
    unresolved syntax and can decide what to do (e.g., use `read`).
 2. **Visited set.** Each `expandText` call accepts a `visited:
@@ -140,10 +141,10 @@ deep and they should restructure.
 ### Helpers (in `src/index.ts`)
 
 - `findAllMatches(text)` — finds `!`cmd``, `!```sh\ncmd\n```,
-  `` `@`path` ``, `@```\npaths\n``` `. Fenced first, then inline;
+  `` @`path` ``, `@```\npaths\n``` `. Fenced first, then inline;
   within each character class (`!` vs `@`), fenced wins; inline
   matches inside any fenced range (of either class) are skipped.
-  The inline `` `@`path` `` regex uses a `(?<!\w)` lookbehind to
+  The inline `` @`path` `` regex uses a `(?<!\w)` lookbehind to
   avoid false positives on email-like text.
 - `runCommand(command, cwd, timeoutMs)` — wraps `bashOps.exec`,
   returns a `CommandOutcome` (output, exitCode, truncated,
@@ -222,6 +223,38 @@ the extension registers, so a regression is caught at `npm test`.
 
 ## Configuration knobs
 
+### Per-extension config file (`pi-cmd-expand.json`)
+
+Two independent on/off toggles, read on `session_start`:
+
+| Location                          | Scope                |
+| --------------------------------- | -------------------- |
+| `~/.pi/agent/pi-cmd-expand.json`  | Global (all projects)|
+| `./.pi/pi-cmd-expand.json`        | Project (this cwd)   |
+
+Schema (all keys optional; missing / wrong-typed / unknown keys
+fall back to defaults without throwing):
+
+```json
+{
+  "enableCmd": true,
+  "enableFile": true
+}
+```
+
+| Key           | Default | Effect                                                                                                                                                                       |
+| ------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enableCmd`   | `true`  | When `false`, `` !`cmd` `` / `` !```sh ` blocks are left as literal text in both user messages and `AGENTS.md` / `CLAUDE.md`. The toggle applies at every expansion level, so `` !`cmd` `` inside a loaded file is also left literal. |
+| `enableFile`  | `true`  | When `false`, `` @`path` `` / `` @``` ` blocks are left as literal text in both user messages and context files. Same recursive semantics.                                    |
+
+Project overrides global on a per-key basis (shallow merge). The
+loader logs parse / IO errors to `console.error` and falls back to
+defaults instead of aborting the session. Mid-session edits to the
+config file do not take effect until the next session start (or
+`/reload`).
+
+### Hard-coded `const` knobs
+
 All five are `const` at the top of `src/index.ts`:
 
 | Constant                   | Default  | Effect                                                                                                                                                                                                                                            |
@@ -229,7 +262,7 @@ All five are `const` at the top of `src/index.ts`:
 | `DEFAULT_TIMEOUT_MS`       | `5_000`  | Per-command timeout. On expiry, partial output (if any) is reported inline followed by `[command failed: timed out after 5000ms]`. Applies to commands executed inside any loaded file as well.                                                  |
 | `DEFAULT_MAX_OUTPUT_BYTES` | `2_000`  | Soft cap on inline command output. Above this, `truncateTail` keeps the last N bytes and the full output is written to a temp file whose path is appended inline so the LLM can `read` it on demand.                                                  |
 | `DEFAULT_MAX_FILE_BYTES`   | `10_000` | Soft cap on inline file content (after recursive expansion). Same truncation policy as commands; full expanded content is persisted to a temp file above this. Larger than the command cap because source files tend to be larger than command output. |
-| `MAX_RECURSION_DEPTH`      | `10`     | Hard cap on `` `@`path` `` nesting. Beyond this depth, `expandText` returns the file content with its `` `@`path` `` references still unexpanded. The LLM sees the unresolved syntax and can decide what to do (e.g., use `read`).                |
+| `MAX_RECURSION_DEPTH`      | `10`     | Hard cap on `` @`path` `` nesting. Beyond this depth, `expandText` returns the file content with its `` @`path` `` references still unexpanded. The LLM sees the unresolved syntax and can decide what to do (e.g., use `read`).                |
 | `SOURCE_MAX_CHARS`         | `20`     | Maximum length of the `source` attribute on `<cmd>` tags. Longer commands are truncated to first 17 chars + `...` (fenced commands use only their first line as the source). Full command still runs — only the visible provenance is short.        |
 
 Temp files are **not** auto-cleaned — they live in `os.tmpdir()`
@@ -246,6 +279,12 @@ From `@earendil-works/pi-coding-agent`:
 - `truncateTail(text, { maxBytes })` — tail-truncates a string.
 - `formatSize(bytes)` — human-readable byte size for the
   truncation footer.
+- `getAgentDir()` — returns `~/.pi/agent/` (honours the
+  `PI_CODING_AGENT_DIR` env var). Used to locate the global config
+  file.
+- `CONFIG_DIR_NAME` — the project-local config directory name
+  (defaults to `.pi`). Used for both the config file lookup and to
+  match pi's convention for project-local resources.
 
 ## Common gotchas
 
@@ -259,15 +298,15 @@ From `@earendil-works/pi-coding-agent`:
   longer forms first — if you add a new form, follow the same
   priority.
 - **`!` and `@` don't interfere.** An inline `!`cmd`` inside a
-  fenced `` `@`path` `` block is just text in the path list; an
-  inline `` `@`path` `` inside a fenced `!```sh\ncmd\n``` ` block is
+  fenced `` @`path` `` block is just text in the path list; an
+  inline `` @`path` `` inside a fenced `!```sh\ncmd\n``` ` block is
   just text in the shell script. Cross-character class interaction
   only happens via the fenced-skip rule (an inline of either class
   inside a fenced range of either class is skipped).
-- **`(?<!\w)` lookbehind on inline `` `@`path` ``.** This avoids
+- **`(?<!\w)` lookbehind on inline `` @`path` ``.** This avoids
   false positives on email-like text (`user@`example.com`` — the
   `r` before `@` excludes it). If you remove it, emails get matched
-  as file paths. `` `@` `` at start-of-string, after whitespace, or
+  as file paths. `` @` `` at start-of-string, after whitespace, or
   after punctuation still triggers.
 - **Failed commands bypass truncation.** Non-zero exit / thrown
   error returns the full partial output + a `[command failed: …]`
@@ -282,7 +321,7 @@ From `@earendil-works/pi-coding-agent`:
   the LLM, but the on-screen chat bubble keeps showing the raw
   `` !`cmd` `` / `` @`path` ``. This is a pi design gap — not
   something the extension can paper over from inside `message_end`.
-- **Recursive temp files can be large.** When `` `@`A`` `` loads a
+- **Recursive temp files can be large.** When `` @`A`` `` loads a
   file whose expansion is large (or whose expansion pulls in more
   large files), the temp file written by `truncateOrKeep` contains
   the FULL expanded content (with all nested refs resolved). The

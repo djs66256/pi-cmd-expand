@@ -66,14 +66,16 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import {
+	CONFIG_DIR_NAME,
 	createLocalBashOperations,
 	type ExtensionAPI,
 	formatSize,
+	getAgentDir,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
 
@@ -96,6 +98,88 @@ const MAX_RECURSION_DEPTH = 10;
  *  attribute stays at or below this limit. Only the first line of
  *  a fenced body is used; the rest of the body is still executed. */
 const SOURCE_MAX_CHARS = 20;
+
+/** File name used for both global and project-local config files.
+ *  Global: `${getAgentDir()}/${CONFIG_FILE_NAME}`
+ *  Project: `${cwd}/${CONFIG_DIR_NAME}/${CONFIG_FILE_NAME}`
+ *  Project entries override global entries on a per-key basis
+ *  (shallow merge). */
+const CONFIG_FILE_NAME = "pi-cmd-expand.json";
+
+/** Resolved runtime configuration. The two `enable*` toggles control
+ *  whether `<cmd>` and `<file>` expansion runs at all; turning them
+ *  off leaves the original `!`...`` / `` @`...` `` syntax in the
+ *  text the LLM sees, untouched. Defaults preserve the historical
+ *  behaviour (everything expanded). */
+interface PiCmdExpandConfig {
+	enableCmd: boolean;
+	enableFile: boolean;
+}
+
+const DEFAULT_CONFIG: PiCmdExpandConfig = {
+	enableCmd: true,
+	enableFile: true,
+};
+
+/** Module-level cache of the most recently loaded config. The
+ *  `session_start` handler refreshes it from disk; the expansion
+ *  functions read from it directly. Treated as immutable between
+ *  `session_start` calls — mid-session edits to the config file
+ *  take effect after the next `/reload`. */
+let currentConfig: PiCmdExpandConfig = { ...DEFAULT_CONFIG };
+
+/** Type-check a raw `unknown` config object and return only the
+ *  recognised keys with valid types / values. Unknown keys are
+ *  silently ignored (lenient schema). Numeric / boolean coercion
+ *  errors do not throw — invalid entries just don't make it into
+ *  the output, so the caller sees a clean partial override that
+ *  defaults can fill the gaps in. */
+function parseConfig(raw: unknown): Partial<PiCmdExpandConfig> {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		return {};
+	}
+	const obj = raw as Record<string, unknown>;
+	const out: Partial<PiCmdExpandConfig> = {};
+	if (typeof obj.enableCmd === "boolean") out.enableCmd = obj.enableCmd;
+	if (typeof obj.enableFile === "boolean") out.enableFile = obj.enableFile;
+	return out;
+}
+
+/** Load the effective config for `cwd`. Reads the global file at
+ *  `${getAgentDir()}/${CONFIG_FILE_NAME}` first, then merges in
+ *  the project file at `${cwd}/${CONFIG_DIR_NAME}/${CONFIG_FILE_NAME}`
+ *  (project wins on a per-key basis). Missing files are no-ops.
+ *  Parse / IO failures are logged but never throw — a broken
+ *  config falls back to defaults instead of aborting the session. */
+function loadConfigFromDisk(cwd: string): PiCmdExpandConfig {
+	let merged: Partial<PiCmdExpandConfig> = {};
+
+	const globalPath = join(getAgentDir(), CONFIG_FILE_NAME);
+	if (existsSync(globalPath)) {
+		try {
+			const raw = JSON.parse(readFileSync(globalPath, "utf-8"));
+			merged = { ...merged, ...parseConfig(raw) };
+		} catch (err) {
+			console.error(
+				`[pi-cmd-expand] failed to load global config at ${globalPath}: ${err}`,
+			);
+		}
+	}
+
+	const projectPath = join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+	if (existsSync(projectPath)) {
+		try {
+			const raw = JSON.parse(readFileSync(projectPath, "utf-8"));
+			merged = { ...merged, ...parseConfig(raw) };
+		} catch (err) {
+			console.error(
+				`[pi-cmd-expand] failed to load project config at ${projectPath}: ${err}`,
+			);
+		}
+	}
+
+	return { ...DEFAULT_CONFIG, ...merged };
+}
 
 const bashOps = createLocalBashOperations();
 
@@ -537,7 +621,17 @@ async function expandText(
 	// what to do (e.g., use `read`).
 	if (depth >= MAX_RECURSION_DEPTH) return text;
 
-	const matches = findAllMatches(text);
+	// Per-kind gating from config: when `enableCmd` is `false`,
+	// `` !`cmd` `` / `!```sh` blocks are left as literal text; same
+	// for `enableFile` and `` @`path` ``. The filter applies at every
+	// recursion level, so a disabled form stays disabled even inside
+	// a loaded file.
+	const allMatches = findAllMatches(text);
+	const matches = allMatches.filter((m) => {
+		if (m.kind === "command" && !currentConfig.enableCmd) return false;
+		if (m.kind === "file" && !currentConfig.enableFile) return false;
+		return true;
+	});
 	if (matches.length === 0) return text;
 
 	let out = text;
@@ -662,6 +756,18 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 	// break pi's own `!!` (excludeFromContext) / cancellation / live
 	// streaming semantics. So we let pi own this path.
 
+	// --- 0) Config load ---------------------------------------------
+	// Refresh `currentConfig` from disk on every session start. This
+	// fires once at startup and again on `/reload`, so users who edit
+	// `pi-cmd-expand.json` between sessions (or while editing during
+	// a session and then `/reload`-ing) see their toggles take effect.
+	// Mid-session edits without `/reload` do NOT take effect until the
+	// next session — same constraint as preset.ts applies to its own
+	// config file.
+	pi.on("session_start", async (_event, ctx) => {
+		currentConfig = loadConfigFromDisk(ctx.cwd);
+	});
+
 	// --- 1) `!cmd` / `@path` in a typed message OR inside a prompt
 	//     template / skill body ------------------------------------
 	// The `input` event fires before skill/template expansion, so it only
@@ -682,10 +788,13 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 		if (event.message.role !== "user") return;
 		const text = extractUserText(event.message.content);
 		if (!text) return;
-		// Fast path: nothing to expand if neither trigger character is
-		// present. Without this, we'd call `findAllMatches` for every
-		// message, even plain prose.
-		if (!text.includes("!") && !text.includes("@")) return;
+		// Fast path: skip expansion when no enabled trigger character
+		// is present. `findAllMatches` would return the same `[]` and
+		// `expandText` would short-circuit anyway, but checking here
+		// avoids the per-message function-call overhead for plain prose.
+		const wantBang = currentConfig.enableCmd && text.includes("!");
+		const wantAt = currentConfig.enableFile && text.includes("@");
+		if (!wantBang && !wantAt) return;
 
 		const expanded = await expandText(text, ctx.cwd, timeoutMs, maxFileBytes);
 		if (expanded === text) return;
@@ -713,7 +822,11 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 		let changed = false;
 
 		for (const file of contextFiles) {
-			if (!file.content.includes("!") && !file.content.includes("@")) continue;
+			// Same fast-path optimization as the `message_end` handler:
+			// skip files whose content has no enabled trigger character.
+			const wantBang = currentConfig.enableCmd && file.content.includes("!");
+			const wantAt = currentConfig.enableFile && file.content.includes("@");
+			if (!wantBang && !wantAt) continue;
 			const expanded = await expandFile(
 				file.path,
 				file.content,
