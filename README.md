@@ -15,6 +15,10 @@ ls -la
 ```
 `````
 
+The fenced form accepts an optional language tag. Common shell tags such as
+`sh`, `bash`, `shell`, `zsh`, and `fish` are all recognized; the tag is only
+syntax metadata and does not select the shell used for execution.
+
 ## What it does
 
 - **`` `!`cmd` ``** anywhere in your typed message → the command runs in the

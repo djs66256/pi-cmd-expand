@@ -105,6 +105,18 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 		assert.doesNotMatch(newText, /!```/);
 	});
 
+	test("bash fenced form is expanded", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "before\n!```bash\necho B\n```\nafter" }],
+				},
+			},
+			ctx,
+		);
+		assert.equal(r.message.content[0].text, "before\nB\nafter");
+	});
 	test("directly-typed inline form is also expanded (no separate `input` hook)", async () => {
 		// After the `input` hook was removed, a directly-typed `!`cmd``
 		// lands in the user message verbatim and is expanded by
