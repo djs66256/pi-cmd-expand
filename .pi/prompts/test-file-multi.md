@@ -11,7 +11,8 @@ Read both of these files at once and tell me the relationship between them:
 
 Expected behaviour:
 - The fenced form reads both files in one expansion pass.
-- Each file gets a `=== <path> ===` header in the inline output, so you
+- Each file is wrapped in its own `<file path="…">…</file>` block (no
+  more `=== path ===` header — the path is in the tag attribute), so you
   can tell which content belongs to which file.
 - Both files must load relative to the agent's cwd (`./README.md` is the
   project's README, `./AGENTS.md` is this repo's developer guide).
@@ -19,5 +20,5 @@ Expected behaviour:
 - The on-screen chat bubble may still show the raw `@```...``` ` text —
   the LLM still receives the expanded content via `message_end`.
 
-If a `[file failed: ENOENT: ...]` appears for one of them, the file path
-  is wrong relative to cwd.
+If a `<file path="..." status="failed" error="ENOENT: ...">[file failed: ENOENT: ...]</file>`
+appears for one of them, the file path is wrong relative to cwd.

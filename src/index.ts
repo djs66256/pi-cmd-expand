@@ -20,6 +20,20 @@
  * current working directory (ctx.cwd), never against the directory
  * of the prompt or context file.
  *
+ * Every match is wrapped in a semantic tag so the LLM can tell what
+ * was generated and where it came from:
+ *
+ *   !`ls -la`               →  <cmd source="ls -la">AUTHORS\nLICENSE\nREADME.md</cmd>
+ *   !```sh\nls -la\n```     →  <cmd lang="sh" source="ls -la">…</cmd>
+ *   @`./README.md`          →  <file path="./README.md">…</file>
+ *   @```\na.md\nb.md\n```   →  <file path="./a.md">…</file>\n\n<file path="./b.md">…</file>
+ *
+ * Tag attributes carry provenance and outcome metadata
+ * (`source`, `lang`, `path`, `status`, `exit-code`, `error`,
+ * `inline-size`, `total-size`). Single-line content uses inline
+ * tag wrapping; multi-line content gets the open/close tags on
+ * their own lines for readability.
+ *
  * - For user input: hooks the `message_end` event and transforms the
  *   text in place. Works for both directly-typed `!`cmd`` / `` @`path` ``
  *   and for the same syntax that lives inside a prompt template / skill
@@ -47,8 +61,8 @@
  * Truncation is also delegated to pi's `truncateTail`: when a command's
  * output or a file's expanded content exceeds its cap, we keep the
  * last N bytes and persist the full content to a temp file. The temp
- * file path is surfaced inline (so the LLM can read it) in the
- * spliced text.
+ * file path is surfaced inline (so the LLM can read it) inside the
+ * `<cmd>` / `<file>` wrap.
  */
 
 import { randomBytes } from "node:crypto";
@@ -77,6 +91,11 @@ const DEFAULT_MAX_FILE_BYTES = 10_000;
  *  case; the visited-set additionally short-circuits actual cycles
  *  long before the cap is reached. */
 const MAX_RECURSION_DEPTH = 10;
+/** Maximum characters in the `source` attribute of a `<cmd>` tag.
+ *  Long commands are truncated to `first 17 chars + "..."` so the
+ *  attribute stays at or below this limit. Only the first line of
+ *  a fenced body is used; the rest of the body is still executed. */
+const SOURCE_MAX_CHARS = 20;
 
 const bashOps = createLocalBashOperations();
 
@@ -85,6 +104,9 @@ interface CommandMatch {
 	end: number;
 	kind: "command";
 	command: string;
+	/** Language tag from the fenced form (`!```sh\n...\n``` `). Empty
+	 *  string for inline commands (`!`cmd``). */
+	lang: string;
 }
 
 interface FileMatch {
@@ -94,18 +116,46 @@ interface FileMatch {
 	/** One entry for inline, one-or-more for fenced. Blank lines
 	 *  inside fenced bodies are skipped. */
 	paths: string[];
-	/** True for `@```...``` `, false for `` @`path` ``. Controls
-	 *  whether each path gets a `=== path ===` header in the output. */
+	/** True for `@```...``` `, false for `` @`path` ``. Currently only
+	 *  controls output labelling, but the inline/fenced distinction
+	 *  may grow more interesting in the future. */
 	fenced: boolean;
 }
 
 type Match = CommandMatch | FileMatch;
 
-/** What a single `!cmd` invocation produces, ready to splice in. */
-interface CommandResult {
-	/** Text to splice into the surrounding text. If truncated, includes
-	 *  a trailing `[Output truncated. Full output: <path>]` note. */
+/** What a single `!cmd` invocation produces. Captured separately from
+ *  the wrapper so the splice loop can decide on attributes (status,
+ *  exit-code, truncation sizes) before emitting the final tag. */
+interface CommandOutcome {
+	/** Body to splice in. For failed commands, includes the
+	 *  `[command failed: …]` marker; for truncated commands, includes
+	 *  the `[Output truncated … Full output: <path>]` footer. */
 	output: string;
+	/** Process exit code. `null` means execution itself failed
+	 *  (timeout, cwd missing, etc.); `0` is success; non-zero is a
+	 *  failing exit. */
+	exitCode: number | null;
+	/** Whether the output was tail-truncated. */
+	truncated: boolean;
+	totalBytes?: number;
+	inlineBytes?: number;
+}
+
+/** What loading a single file path produces. */
+interface FileOutcome {
+	/** Body to splice in. For failed reads, the `[file failed: …]`
+	 *  marker; for circular references, `[file skipped: circular
+	 *  reference: …]`; for truncated files, the truncated content
+	 *  + `[Output truncated …]` footer. */
+	output: string;
+	/** Outcome classification. */
+	status: "ok" | "failed" | "circular" | "truncated";
+	/** Only present when `status === "failed"`. */
+	error?: string;
+	/** Only present when `status === "truncated"`. */
+	totalBytes?: number;
+	inlineBytes?: number;
 }
 
 /** Find all `!`cmd`` / `!```sh\ncmd\n``` ` / `` @`path` `` /
@@ -125,7 +175,13 @@ function findAllMatches(text: string): Match[] {
 	for (const m of text.matchAll(cmdFencedRe)) {
 		const start = m.index ?? 0;
 		const end = start + m[0].length;
-		matches.push({ start, end, kind: "command", command: m[2] });
+		matches.push({
+			start,
+			end,
+			kind: "command",
+			command: m[2],
+			lang: m[1],
+		});
 		fencedRanges.push([start, end]);
 	}
 
@@ -150,7 +206,7 @@ function findAllMatches(text: string): Match[] {
 		const start = m.index ?? 0;
 		const end = start + m[0].length;
 		if (fencedRanges.some(([s, e]) => start >= s && end <= e)) continue;
-		matches.push({ start, end, kind: "command", command: m[1] });
+		matches.push({ start, end, kind: "command", command: m[1], lang: "" });
 	}
 
 	// Inline file reference: @`path`  (no newlines, no nested backticks).
@@ -216,11 +272,84 @@ async function writeFullOutput(fullOutput: string): Promise<string> {
 	return path;
 }
 
+/** Choose single vs double quotes for an attribute value, preferring
+ *  double quotes and falling back to single quotes only if the value
+ *  contains a `"`. (Both quotes in one value would still break, but
+ *  that combination is exotic enough to ignore.) */
+function quoteAttr(value: string): string {
+	return value.includes('"') ? `'${value}'` : `"${value}"`;
+}
+
+/** Truncate the `source` attribute for `<cmd>` tags so it stays at or
+ *  below `SOURCE_MAX_CHARS`. For multi-line bodies (fenced commands),
+ *  only the first line is used as the source — the full body is still
+ *  executed, the source attribute is just a provenance hint. */
+function truncateSource(source: string): string {
+	const firstLine = source.split("\n")[0];
+	if (firstLine.length <= SOURCE_MAX_CHARS) return firstLine;
+	return firstLine.slice(0, SOURCE_MAX_CHARS - 3) + "...";
+}
+
 /**
- * Execute `command` in `cwd` and return its combined stdout/stderr,
- * tail-truncated to `DEFAULT_MAX_OUTPUT_BYTES`. On overflow, the full
- * output is written to a temp file whose path is appended inline so
- * the LLM can read it on demand.
+ * Wrap `content` with `<tagName attrs>` / `</tagName>`. Single-line
+ * content (after stripping a trailing newline) is wrapped inline —
+ * tags sit on the same line as the content. Multi-line content is
+ * wrapped across three lines: open tag, content, close tag. The
+ * trailing newline is always stripped from the body so we don't
+ * produce a stray `\n` right before the close tag.
+ */
+function wrapWithTag(tagName: string, attrs: string, content: string): string {
+	const body = content.replace(/\n$/, "");
+	const lineCount = body === "" ? 0 : body.split("\n").length;
+	if (lineCount <= 1) {
+		return `<${tagName}${attrs}>${body}</${tagName}>`;
+	}
+	return `<${tagName}${attrs}>\n${body}\n</${tagName}>`;
+}
+
+/** Build the `<cmd>` wrapper for a `CommandOutcome`. */
+function formatCmdWrap(
+	outcome: CommandOutcome,
+	command: string,
+	lang: string,
+): string {
+	const attrs: string[] = [];
+	attrs.push(` source=${quoteAttr(truncateSource(command))}`);
+	if (lang) attrs.push(` lang=${quoteAttr(lang)}`);
+	if (outcome.exitCode !== null && outcome.exitCode !== 0) {
+		attrs.push(
+			` status="failed" exit-code=${quoteAttr(String(outcome.exitCode))}`,
+		);
+	} else if (outcome.truncated) {
+		attrs.push(
+			` status="truncated" inline-size=${quoteAttr(String(outcome.inlineBytes))} total-size=${quoteAttr(String(outcome.totalBytes))}`,
+		);
+	}
+	return wrapWithTag("cmd", attrs.join(""), outcome.output);
+}
+
+/** Build the `<file>` wrapper for a `FileOutcome`. */
+function formatFileWrap(outcome: FileOutcome, path: string): string {
+	const attrs: string[] = [];
+	attrs.push(` path=${quoteAttr(path)}`);
+	if (outcome.status === "failed") {
+		attrs.push(` status="failed" error=${quoteAttr(outcome.error ?? "")}`);
+	} else if (outcome.status === "circular") {
+		attrs.push(` status="circular"`);
+	} else if (outcome.status === "truncated") {
+		attrs.push(
+			` status="truncated" inline-size=${quoteAttr(String(outcome.inlineBytes))} total-size=${quoteAttr(String(outcome.totalBytes))}`,
+		);
+	}
+	return wrapWithTag("file", attrs.join(""), outcome.output);
+}
+
+/**
+ * Execute `command` in `cwd` and return a `CommandOutcome` with the
+ * combined stdout/stderr (trailing newline stripped), an `exitCode`,
+ * and any truncation metadata. Never throws — execution failures
+ * are captured as `exitCode: null` with an inline `[command failed: …]`
+ * marker in `output`.
  *
  * Streams data through pi's `bashOps.exec` (which is the same backend
  * pi's built-in `bash` tool uses) so we get cross-platform shell
@@ -231,7 +360,7 @@ async function runCommand(
 	command: string,
 	cwd: string,
 	timeoutMs: number,
-): Promise<CommandResult> {
+): Promise<CommandOutcome> {
 	const chunks: Buffer[] = [];
 	let exitCode: number | null = 0;
 
@@ -251,32 +380,42 @@ async function runCommand(
 		const parts: string[] = [];
 		if (partial) parts.push(partial);
 		parts.push(`[command failed: ${describeExecError(err, timeoutMs)}]`);
-		// Failures get inlined verbatim -- they're already short and
+		// Failures get inlined verbatim — they're already short and
 		// truncation would only obscure the diagnostic.
-		return { output: parts.join("\n") };
+		return { output: parts.join("\n"), exitCode: null, truncated: false };
 	}
 
 	const raw = Buffer.concat(chunks).toString("utf-8").replace(/\n$/, "");
 
 	// Non-zero exit: surface the output plus a failure note inline.
-	// No truncation -- the failure detail (incl. partial stdout/stderr)
+	// No truncation — the failure detail (incl. partial stdout/stderr)
 	// is what the LLM needs to diagnose the problem.
 	if (exitCode !== null && exitCode !== 0) {
 		const parts: string[] = [];
 		if (raw) parts.push(raw);
 		parts.push(`[command failed: exit code ${exitCode}]`);
-		return { output: parts.join("\n") };
+		return { output: parts.join("\n"), exitCode, truncated: false };
 	}
 
 	// Success path: tail-truncate if the output is over the soft cap.
 	const truncation = truncateTail(raw, { maxBytes: DEFAULT_MAX_OUTPUT_BYTES });
 	if (!truncation.truncated) {
-		return { output: truncation.content };
+		return {
+			output: truncation.content,
+			exitCode: 0,
+			truncated: false,
+		};
 	}
 
 	const fullOutputPath = await writeFullOutput(raw);
 	const footer = `\n\n[Output truncated to last ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}. Full output: ${fullOutputPath}]`;
-	return { output: truncation.content + footer };
+	return {
+		output: truncation.content + footer,
+		exitCode: 0,
+		truncated: true,
+		inlineBytes: truncation.outputBytes,
+		totalBytes: truncation.totalBytes,
+	};
 }
 
 /** Resolve `relPath` against `cwd`; absolute paths are used verbatim. */
@@ -285,44 +424,33 @@ function resolveFilePath(relPath: string, cwd: string): string {
 }
 
 /**
- * Read `relPath` (resolved against `cwd`) and return its raw UTF-8
- * content. On error, return a `[file failed: …]` string that the
- * caller can splice in directly — never throws. Distinguishing this
- * from a successful read lets the caller skip recursive expansion
- * (which would otherwise try to expand an error string).
+ * Read `relPath` (resolved against `cwd`) and return a `FileOutcome`
+ * with the raw UTF-8 content on success, or a `[file failed: …]`
+ * marker on error (never throws). The caller checks `status` to
+ * decide whether to recurse into the content for further `@`/`!`
+ * expansion.
  */
-async function loadFileRaw(relPath: string, cwd: string): Promise<string> {
+async function loadFileRaw(relPath: string, cwd: string): Promise<FileOutcome> {
 	const absPath = resolveFilePath(relPath, cwd);
 	try {
-		return await fs.readFile(absPath, "utf-8");
+		const content = await fs.readFile(absPath, "utf-8");
+		return { output: content, status: "ok" };
 	} catch (err) {
-		return `[file failed: ${describeFileError(err)}]`;
+		const errorMsg = describeFileError(err);
+		return {
+			output: `[file failed: ${errorMsg}]`,
+			status: "failed",
+			error: errorMsg,
+		};
 	}
-}
-
-/**
- * If `content` fits in `maxBytes`, return it verbatim. Otherwise
- * tail-truncate via pi's `truncateTail`, write the full content to a
- * temp file, and return the truncated text + a `[Output truncated …
- * Full output: <path>]` footer. Never throws.
- */
-async function truncateOrKeep(
-	content: string,
-	maxBytes: number,
-): Promise<string> {
-	const truncation = truncateTail(content, { maxBytes });
-	if (!truncation.truncated) {
-		return truncation.content;
-	}
-	const fullOutputPath = await writeFullOutput(content);
-	const footer = `\n\n[Output truncated to last ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}. Full output: ${fullOutputPath}]`;
-	return truncation.content + footer;
 }
 
 /**
  * Load each path in a `FileMatch`, recursively expand its content
- * (so nested `!`/`@` patterns inside the loaded file are resolved),
- * apply the per-file truncation cap, and format the joined output.
+ * (so nested `!`/`@` patterns inside the loaded file are resolved
+ * and themselves wrapped in their own `<cmd>` / `<file>` tags),
+ * apply the per-file truncation cap, and format each path into a
+ * `<file>` wrapper.
  *
  * Reads in parallel (`Promise.all`) since file I/O is independent.
  * Each parallel task uses its own copy of `visited` so a file shared
@@ -344,27 +472,42 @@ async function expandFileReferences(
 		if (visited.has(absPath)) {
 			// Circular reference: emit a clear inline marker instead of
 			// recursing (which would loop until the depth cap kills it).
-			const skipNote = `[file skipped: circular reference: ${p}]`;
-			return match.fenced ? `=== ${p} ===\n${skipNote}` : skipNote;
+			const outcome: FileOutcome = {
+				output: `[file skipped: circular reference: ${p}]`,
+				status: "circular",
+			};
+			return formatFileWrap(outcome, p);
 		}
-		const rawContent = await loadFileRaw(p, cwd);
-		let content = rawContent;
-		// Only recurse into successfully-read files. An error string
-		// must not be parsed for further `@` references.
-		if (!content.startsWith("[file failed:")) {
+		const rawOutcome = await loadFileRaw(p, cwd);
+		let outcome = rawOutcome;
+		// Only recurse into successfully-read files. An error or
+		// circular outcome must not be parsed for further `@` refs.
+		if (outcome.status === "ok") {
 			const newVisited = new Set(visited);
 			newVisited.add(absPath);
-			content = await expandText(
-				content,
+			const expanded = await expandText(
+				outcome.output,
 				cwd,
 				timeoutMs,
 				maxFileBytes,
 				depth + 1,
 				newVisited,
 			);
-			content = await truncateOrKeep(content, maxFileBytes);
+			const truncation = truncateTail(expanded, { maxBytes: maxFileBytes });
+			if (!truncation.truncated) {
+				outcome = { output: truncation.content, status: "ok" };
+			} else {
+				const fullOutputPath = await writeFullOutput(expanded);
+				const footer = `\n\n[Output truncated to last ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}. Full output: ${fullOutputPath}]`;
+				outcome = {
+					output: truncation.content + footer,
+					status: "truncated",
+					inlineBytes: truncation.outputBytes,
+					totalBytes: truncation.totalBytes,
+				};
+			}
 		}
-		return match.fenced ? `=== ${p} ===\n${content}` : content;
+		return formatFileWrap(outcome, p);
 	});
 	const blocks = (await Promise.all(tasks)).filter(
 		(b): b is string => b !== null,
@@ -375,9 +518,10 @@ async function expandFileReferences(
 /**
  * Replace every `!`cmd`` / `!```sh\ncmd\n``` ` / `` @`path` `` /
  * `@```\npaths\n``` ` occurrence in `text` with the corresponding
- * output. Walks matches from the end so earlier byte offsets stay
- * valid as we splice. Recurses into loaded file content (via the
- * `depth` / `visited` parameters) so `@` references can chain.
+ * `<cmd>` / `<file>` wrap. Walks matches from the end so earlier
+ * byte offsets stay valid as we splice. Recurses into loaded file
+ * content (via the `depth` / `visited` parameters) so `@` references
+ * can chain.
  */
 async function expandText(
 	text: string,
@@ -401,7 +545,8 @@ async function expandText(
 		const m = matches[i];
 		let replacement: string;
 		if (m.kind === "command") {
-			replacement = (await runCommand(m.command, cwd, timeoutMs)).output;
+			const outcome = await runCommand(m.command, cwd, timeoutMs);
+			replacement = formatCmdWrap(outcome, m.command, m.lang);
 		} else {
 			replacement = await expandFileReferences(
 				m,

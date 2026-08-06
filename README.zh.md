@@ -29,9 +29,10 @@ fenced 形式的语言标签是可选的。命令形式的 shell 标签（例如
 ## 作用
 
 - 用户输入消息中任意位置的 **`` `!`cmd` ``** → 命令在 agent 当前工作
-  目录下执行，输出就地拼接进消息，agent 看到的就是替换后的文本。
-- 用户输入消息中任意位置的 **`` `@`path` ``** → 文件的 UTF-8 内容就地
-  拼进消息，agent 看到的就是替换后的文本。路径以 agent 的 cwd 为基准
+  目录下执行，输出包装在 `<cmd source="…">…</cmd>` 里，agent 看到
+  的就是替换后的文本。
+- 用户输入消息中任意位置的 **`` `@`path` ``** → 文件的 UTF-8 内容
+  包装在 `<file path="…">…</file>` 里。路径以 agent 的 cwd 为基准
   解析，绝对路径则原样使用。
 - **`AGENTS.md` / `CLAUDE.md`** 中的 **`` `!`cmd` ``** / **`` `@`path` ``**
   → 在会话开始时展开同一规则，所以项目上下文里可以直接放实时的文件
@@ -40,6 +41,11 @@ fenced 形式的语言标签是可选的。命令形式的 shell 标签（例如
   规则，里面的 `` `@`path` `` 或 `` `!`cmd` `` 也会被解析（深度上限
   10；环引用会被短路）。所以一条 `` `@`./README.md` `` 可以一次性把
   整棵文档树拉进上下文。
+
+每次展开都会包装在语义标签（`<cmd>` 或 `<file>`）里，属性携带来源
+（`source`、`path`、`lang`）和结果元数据（`status`、`exit-code`、
+`error`、`inline-size`、`total-size`）。单行内容走行内包装，多行
+内容走多行包装（开/闭标签独占一行）。
 
 所有命令执行和文件路径解析都以 **agent 的 cwd**（`ctx.cwd`）为基准，
 不是 prompt 或上下文文件所在目录。
@@ -97,8 +103,21 @@ ls tests/ | head -10
 
 pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件系统
 快照、`src/index.ts` 的完整内容（如果它内部还包含 `` `@`path` `` /
-`` `!`cmd` `` 会被递归展开），以及带 `=== path ===` 标头的 `README.md`
-和 `CHANGELOG.md`。
+`` `!`cmd` `` 会被递归展开），以及 `README.md` 和 `CHANGELOG.md` —
+每个文件各自带 `<file>` 包装。
+
+Inline（单文件）：
+```
+…入口：<file path="./src/index.ts">…</file>…
+```
+
+Fenced（多文件，每个文件一个 wrap）：
+```
+…姊妹文档：
+<file path="./README.md">…</file>
+
+<file path="./CHANGELOG.md">…</file>
+```
 
 ## 作用范围
 
@@ -125,33 +144,54 @@ pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件�
 
 ## 行为说明
 
-- **失败处理** — 失败的命令就地标注为
+- **包装格式** — 每次展开都包装在 `<cmd>…</cmd>` 或 `<file>…</file>`
+  里。来源在属性里（命令的 `source`、文件的 `path`、fenced 命令可选
+  的 `lang`）。结果元数据（`status="failed" exit-code="N"`、
+  `status="truncated" inline-size=… total-size=…`、
+  `status="circular"`）在出错时附加；标签正文仍然保留人类可读的
+  `[command failed: …]` / `[file failed: …]` /
+  `[Output truncated …]` / `[file skipped: circular reference: …]`
+  标记。单行内容行内包装（`<cmd source="ls">AUTHORS</cmd>`）；多行
+  内容多行包装，标签独占一行：
+  ```
+  <cmd source="ls -1">
+  AUTHORS
+  LICENSE
+  README.md
+  </cmd>
+  ```
+- **失败处理** — 失败的命令在 wrap 里标注为
   `[command failed: exit code N]`（如有 stdout/stderr 会在错误信息
-  上方一并保留）；找不到的文件就地标注为
+  上方一并保留）；找不到的文件在 wrap 里标注为
   `[file failed: ENOENT: no such file or directory, open '/abs/path']`；
-  `` `@`path` `` 出现环引用时则就地标注为
-  `[file skipped: circular reference: ./foo.md]`。展开过程永远不会
-  抛异常，所以一个坏掉的  `` `!`cmd` ``  或  `` `@`path` ``  不会让
-  整轮中断。
+  `` `@`path` `` 出现环引用时则在 wrap 里标注为
+  `[file skipped: circular reference: ./foo.md]`。展开过程永远
+  不会抛异常，所以一个坏掉的  `` `!`cmd` ``  或  `` `@`path` ``  不
+  会让整轮中断。
 - **输出截断** — 单条命令输出超过 2 KB 会被尾部截断，文件内容
   超过 10 KB 会被尾部截断，完整内容写到
   `/tmp/pi-cmd-expand-*.log`，路径会作为
-  `[Output truncated ... Full output: <path>]` 追加到插入文本里，
-  LLM 可按需读取。失败的命令不走截断，保留诊断信息。
-- **递归加载** — 通过 `` `@`path` `` 加载的文件会走和顶层文本同样
-  的展开管线，深度上限 10。环引用通过 per-chain visited set 短路。
-  深度上限只是一个安全网，正常使用 1–3 层就够了。
+  `[Output truncated ... Full output: <path>]` 放在 wrap 里，LLM
+  可按需读取。失败的命令不走截断，保留诊断信息。
+- **递归加载** — 通过 `` `@`path` `` 加载的文件会走和顶层文本
+  同样的展开管线，深度上限 10。环引用通过 per-chain visited set
+  短路。深度上限只是一个安全网，正常使用 1–3 层就够了。递归
+  展开会产生嵌套的 `<file>` 标签（外层来自用户 prompt，内层来自
+  被加载文件的内部）。
 - **缓存** — 上下文文件展开按 `path + mtime + size` 缓存在当前
   会话内，多轮对话中不会重复执行命令或重新读取同样的文件。被
   `` `@`path` `` 加载进来的文件**不会**单独缓存——它们是作为包含
   文件展开结果的一部分被缓存的，只在包含文件变化时重新读取。
-- **超时** — 每条命令 5 秒。慢命令会被杀，标注为
+- **超时** — 每条命令 5 秒。慢命令会被杀，在 wrap 里标注为
   `[command failed: timed out after 5000ms]`。
 - **Shell** — 通过 pi 内置的 `createLocalBashOperations()` 执行，
   所以 shell 解析（Windows Git Bash、WSL、Unix `/bin/bash`、
-  `sh` 兜底）、输出清理（去 ANSI、控制字符、CR 归一化）、超时杀
-  整棵进程树都是直接复用 pi `bash` 工具的能力。`|`、`>`、`$VAR`
+  `sh` 兜底）、输出清理（去 ANSI、控制字符、CR 归一化）、超时
+  杀整棵进程树都是直接复用 pi `bash` 工具的能力。`|`、`>`、`$VAR`
   都能正常工作。
+- **source 截断** — `<cmd>` 标签的 `source` 属性会截断到 ≤ 20 字
+  （fenced 形式只取第一行，超出加 `...`）。长命令照常执行，只是
+  可视的来源变短。
 - **邮箱安全** — 内联 `` `@`path` `` 用了 `(?<!\w)` lookbehind，
   所以邮件式文本（如 `` user@`example.com` ``）不会被误匹配。
   紧跟单词字符（字母数字 / `_`）后的 `` `@` `` 不会被匹配；位于

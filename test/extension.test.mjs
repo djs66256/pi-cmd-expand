@@ -101,7 +101,10 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 		);
 		assert.ok(r?.message, "message_end should return a replacement message");
 		const newText = r.message.content[0].text;
-		assert.equal(newText, "before\nF\nafter");
+		assert.equal(
+			newText,
+			'before\n<cmd source="echo F" lang="sh">F</cmd>\nafter',
+		);
 		assert.doesNotMatch(newText, /!```/);
 	});
 
@@ -117,7 +120,10 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 			},
 			ctx,
 		);
-		assert.equal(r.message.content[0].text, "before\nB\nafter");
+		assert.equal(
+			r.message.content[0].text,
+			'before\n<cmd source="echo B" lang="bash">B</cmd>\nafter',
+		);
 	});
 	test("directly-typed inline form is also expanded (no separate `input` hook)", async () => {
 		// After the `input` hook was removed, a directly-typed `!`cmd``
@@ -132,7 +138,10 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 			},
 			ctx,
 		);
-		assert.equal(r.message.content[0].text, "check: MID");
+		assert.equal(
+			r.message.content[0].text,
+			'check: <cmd source="echo MID">MID</cmd>',
+		);
 	});
 
 	test("text without `!` -- no-op", async () => {
@@ -200,7 +209,10 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 			},
 			ctx,
 		);
-		assert.equal(r.message.content[0].text, "A and B");
+		assert.equal(
+			r.message.content[0].text,
+			'<cmd source="echo A">A</cmd> and <cmd source="echo B">B</cmd>',
+		);
 	});
 
 	test("replacement message preserves non-text fields (timestamp, id)", async () => {
@@ -214,7 +226,10 @@ describe("message_end (`!cmd` after template / skill expansion, or directly type
 		assert.equal(r.message.role, "user");
 		assert.equal(r.message.timestamp, 1700000000000);
 		assert.equal(r.message.id, "msg-123");
-		assert.equal(r.message.content[0].text, "keep-meta");
+		assert.equal(
+			r.message.content[0].text,
+			'<cmd source="echo keep-meta">keep-meta</cmd>',
+		);
 	});
 });
 
@@ -328,7 +343,10 @@ describe("truncation (output > 2000 bytes)", () => {
 			},
 			ctx,
 		);
-		assert.equal(r.message.content[0].text, "data: tiny");
+		assert.equal(
+			r.message.content[0].text,
+			'data: <cmd source="echo tiny">tiny</cmd>',
+		);
 		assert.doesNotMatch(r.message.content[0].text, /\[Output truncated/);
 	});
 
@@ -378,13 +396,322 @@ describe("timeout (default 5 s)", () => {
 		);
 		assert.ok(r?.message);
 		const out = r.message.content[0].text;
+		// Source attribute echoes the command verbatim (so the LLM knows
+		// what was run) -- DONE shows up there. The assertion is about
+		// the BODY of the wrap, not the source attribute: the timeout
+		// must have killed the process before `echo DONE` ran, so DONE
+		// must not appear between `>...</cmd>`.
+		const body = out.replace(/<cmd[^>]*>/, "").replace(/<\/cmd>$/, "");
 		assert.doesNotMatch(
-			out,
+			body,
 			/DONE/,
 			"the 8s command must be killed before it can echo DONE",
 		);
 		assert.match(out, /command failed/);
 		assert.match(out, /timed out after 5000ms/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Wrap format: <cmd>/<file> tags + source truncation + status attrs
+// ---------------------------------------------------------------------------
+// Every expansion is wrapped in `<cmd ...>...</cmd>` or `<file ...>...</file>`
+// so the LLM can tell which content was generated and where it came
+// from. The `source` attribute on `<cmd>` is truncated to 20 chars;
+// `path` on `<file>` is preserved verbatim. Status attributes
+// (`status="failed" exit-code="N"`, `status="truncated" inline-size=N
+// total-size=M`, `status="circular"`) are added when something went
+// wrong; the body still carries the human-readable marker.
+// ---------------------------------------------------------------------------
+
+describe("wrap format (<cmd>/<file> tags)", () => {
+	test("inline `!`cmd`` uses single-line inline wrap when output is one line", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!`echo single`" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		// Tag, content, tag — all on one line.
+		assert.equal(out, '<cmd source="echo single">single</cmd>');
+	});
+
+	test("inline `!`cmd`` uses multi-line wrap when output spans multiple lines", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!`echo l1; echo l2`" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		// Open tag on its own line, content in the middle, close tag on its own line.
+		assert.match(out, /^<cmd source="echo l1; echo l2">\n/);
+		assert.match(out, /\n<\/cmd>$/);
+		assert.match(out, /l1\nl2/);
+	});
+
+	test("fenced `!```sh` keeps the lang attribute and uses multi-line wrap for multi-line output", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!```sh\necho l1; echo l2\n```" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.match(out, /^<cmd source="echo l1; echo l2" lang="sh">\n/);
+		assert.match(out, /\n<\/cmd>$/);
+	});
+
+	test("fenced `!```sh` keeps the lang attribute and uses inline wrap for single-line output", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!```sh\necho fenced\n```" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.equal(out, '<cmd source="echo fenced" lang="sh">fenced</cmd>');
+	});
+
+	test("source attribute is truncated to ≤20 chars (with trailing `...` indicator)", async () => {
+		const long = "!`echo aaaaaaaaaaaaaaa bbbbbbbbbbbbbbb ccccccccccccccc`";
+		const r = await handlers.message_end(
+			{ message: { role: "user", content: [{ type: "text", text: long }] } },
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		const m = out.match(/source="([^"]+)"/);
+		assert.ok(m, "must have a source attribute");
+		assert.ok(
+			m[1].length <= 20,
+			`source must be ≤20 chars, got ${m[1].length}: "${m[1]}"`,
+		);
+		assert.ok(m[1].endsWith("..."), "truncated source must end with `...`");
+	});
+
+	test("source attribute at exactly 20 chars is NOT truncated", async () => {
+		// "echo 123456789012345" is 20 chars — at the cap, not over it.
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!`echo 123456789012345`" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.match(out, /source="echo 123456789012345"/);
+		assert.doesNotMatch(out, /\.\.\."/);
+	});
+
+	test("fenced command: source uses only the first line of the body", async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "!```sh\necho FIRST\necho SECOND\n```",
+						},
+					],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.match(out, /source="echo FIRST"/);
+		// SECOND shows up in the body (the command ran both lines), but
+		// NOT in the source attribute.
+		const m = out.match(/source="([^"]+)"/);
+		assert.ok(m);
+		assert.doesNotMatch(m[1], /SECOND/);
+	});
+
+	test('failed command gets status="failed" exit-code="N" attributes', async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!`sh -c 'echo p; exit 9'`" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.match(out, /status="failed"/);
+		assert.match(out, /exit-code="9"/);
+		assert.match(out, /\[command failed: exit code 9\]/);
+	});
+
+	test('truncated command gets status="truncated" inline-size total-size attributes', async () => {
+		// 4 KB output, way above the 2 KB cap.
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "!`printf 'A%.0s' {1..4000}`" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.match(out, /status="truncated"/);
+		assert.match(out, /inline-size="\d+"/);
+		assert.match(out, /total-size="\d+"/);
+		assert.match(out, /\[Output truncated/);
+	});
+
+	test("inline `` @`path` `` uses single-line wrap when file content is one line", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-test-"));
+		try {
+			const file = join(tmp, "one-line.md");
+			writeFileSync(file, "ONLY-ONE");
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `@\`${file}\`` }],
+					},
+				},
+				ctx,
+			);
+			assert.equal(
+				r.message.content[0].text,
+				`<file path="${file}">ONLY-ONE</file>`,
+			);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("inline `` @`path` `` uses multi-line wrap when file has multiple lines", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-test-"));
+		try {
+			const file = join(tmp, "multi-line.md");
+			writeFileSync(file, "line 1\nline 2\nline 3");
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `@\`${file}\`` }],
+					},
+				},
+				ctx,
+			);
+			const out = r.message.content[0].text;
+			assert.match(out, new RegExp(`^<file path="${file}">\n`));
+			assert.match(out, /\n<\/file>$/);
+			assert.match(out, /line 1\nline 2\nline 3/);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test('missing file gets status="failed" error="..." attributes', async () => {
+		const r = await handlers.message_end(
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "@`./no-such-file.md`" }],
+				},
+			},
+			ctx,
+		);
+		const out = r.message.content[0].text;
+		assert.match(out, /status="failed"/);
+		assert.match(out, /error="ENOENT/);
+		assert.match(out, /\[file failed: ENOENT/);
+	});
+
+	test('truncated file gets status="truncated" attributes', async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-test-"));
+		try {
+			const file = join(tmp, "big.md");
+			writeFileSync(file, "Q".repeat(15_000));
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `@\`${file}\`` }],
+					},
+				},
+				ctx,
+			);
+			const out = r.message.content[0].text;
+			assert.match(out, new RegExp(`path="${file}"`));
+			assert.match(out, /status="truncated"/);
+			assert.match(out, /\[Output truncated/);
+			const m = out.match(/Full output: (\S+pi-cmd-expand-[0-9a-f]+\.log)/);
+			if (m) unlinkSync(m[1]);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test('circular file reference gets status="circular" attribute', async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-test-"));
+		try {
+			const a = join(tmp, "circ-a.md");
+			const b = join(tmp, "circ-b.md");
+			writeFileSync(a, "a-start\n@`" + b + "`\na-end");
+			writeFileSync(b, "b-start\n@`" + a + "`\nb-end");
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `@\`${a}\`` }],
+					},
+				},
+				ctx,
+			);
+			const out = r.message.content[0].text;
+			assert.match(out, /status="circular"/);
+			assert.match(out, /\[file skipped: circular reference/);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	test("fenced multi-file: each file gets its own <file> wrap, no === header", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-test-"));
+		try {
+			const a = join(tmp, "a.md");
+			const b = join(tmp, "b.md");
+			writeFileSync(a, "AAA");
+			writeFileSync(b, "BBB");
+			const r = await handlers.message_end(
+				{
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `@\`\`\`\n${a}\n${b}\n\`\`\`` }],
+					},
+				},
+				ctx,
+			);
+			const out = r.message.content[0].text;
+			// No `=== ... ===` header anymore -- the path is in the tag.
+			assert.doesNotMatch(out, /^=== /m);
+			// Two separate wraps.
+			const wraps = out.match(/<file path="/g) ?? [];
+			assert.equal(wraps.length, 2);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -416,7 +743,10 @@ describe("message_end (`@`path` -- inline file reference)", () => {
 				ctx,
 			);
 			assert.ok(r?.message);
-			assert.equal(r.message.content[0].text, "before Hello, world! after");
+			assert.equal(
+				r.message.content[0].text,
+				`before <file path="${file}">Hello, world!</file> after`,
+			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -436,7 +766,10 @@ describe("message_end (`@`path` -- inline file reference)", () => {
 				},
 				ctx,
 			);
-			assert.equal(r.message.content[0].text, "see spaced content here");
+			assert.equal(
+				r.message.content[0].text,
+				`see <file path="${file}">spaced content</file> here`,
+			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -456,7 +789,10 @@ describe("message_end (`@`path` -- inline file reference)", () => {
 				},
 				ctx,
 			);
-			assert.equal(r.message.content[0].text, "abs content");
+			assert.equal(
+				r.message.content[0].text,
+				`<file path="${file}">abs content</file>`,
+			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -530,7 +866,10 @@ describe("message_end (`@`path` -- inline file reference)", () => {
 				},
 				ctx,
 			);
-			assert.equal(r.message.content[0].text, "text OK end");
+			assert.equal(
+				r.message.content[0].text,
+				`text <file path="${file}">OK</file> end`,
+			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -560,15 +899,19 @@ describe("message_end (`@```...``` `-- fenced file reference, multi-file)", () =
 				ctx,
 			);
 			const out = r.message.content[0].text;
-			assert.match(out, /=== /);
+			assert.match(out, /<file path=/);
 			assert.match(out, /AAA/);
 			assert.match(out, /BBB/);
 			assert.doesNotMatch(out, /@```/);
-			// Fenced form preserves order and labels each entry.
+			// Fenced form preserves order and labels each entry with its
+			// own <file path="..."> wrapper.
 			assert.ok(
 				out.indexOf("AAA") < out.indexOf("BBB"),
 				"paths must appear in the order listed in the fenced body",
 			);
+			// Two separate wraps, one per file.
+			const wraps = out.match(/<file path=/g) ?? [];
+			assert.equal(wraps.length, 2);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -595,10 +938,10 @@ describe("message_end (`@```...``` `-- fenced file reference, multi-file)", () =
 			);
 			const out = r.message.content[0].text;
 			assert.match(out, /ONLY/);
-			// Only one `=== ... ===` header -- blank lines didn't spawn
-			// phantom blocks.
-			const headers = out.match(/^=== .* ===$/gm) ?? [];
-			assert.equal(headers.length, 1);
+			// Only one <file> wrap -- blank lines didn't spawn phantom
+			// blocks.
+			const wraps = out.match(/<file path=/g) ?? [];
+			assert.equal(wraps.length, 1);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -618,10 +961,13 @@ describe("message_end (`@```...``` `-- fenced file reference, multi-file)", () =
 				},
 				ctx,
 			);
-			assert.match(r.message.content[0].text, /tagged body/);
+			const out = r.message.content[0].text;
+			assert.match(out, /tagged body/);
 			assert.match(
-				r.message.content[0].text,
-				new RegExp(`=== .*${file}.* ===`),
+				out,
+				new RegExp(
+					`<file path="${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}">tagged body</file>`,
+				),
 			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
@@ -871,7 +1217,10 @@ describe("truncation (file content > 10000 bytes)", () => {
 				},
 				ctx,
 			);
-			assert.equal(r.message.content[0].text, "tiny");
+			assert.equal(
+				r.message.content[0].text,
+				`<file path="${file}">tiny</file>`,
+			);
 			assert.doesNotMatch(r.message.content[0].text, /\[Output truncated/);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
@@ -960,7 +1309,7 @@ describe("before_agent_start (context file `@`path` expansion)", () => {
 			);
 			assert.match(r.systemPrompt, /X-CONTENT/);
 			assert.match(r.systemPrompt, /Y-CONTENT/);
-			assert.match(r.systemPrompt, /=== /);
+			assert.match(r.systemPrompt, /<file path=/);
 			assert.doesNotMatch(r.systemPrompt, /@```/);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });

@@ -178,7 +178,7 @@ describe("user-message expansion path: LLM must see the expanded text, not the r
 		await replayPromptTemplatePath(userMessage, (llmCtx) => {
 			seen = llmCtx.messages.find((m) => m.role === "user")?.content?.[0]?.text;
 		});
-		assert.equal(seen, "ping: PONG");
+		assert.equal(seen, 'ping: <cmd source="echo PONG">PONG</cmd>');
 	});
 
 	test("agent state and LLM context both see the expanded text", async () => {
@@ -196,11 +196,11 @@ describe("user-message expansion path: LLM must see the expanded text, not the r
 		});
 		assert.equal(
 			ctxForLlm.messages[0].content[0].text,
-			`cwd: ${require("node:fs").realpathSync(process.cwd())}`,
+			`cwd: <cmd source="pwd -P">${require("node:fs").realpathSync(process.cwd())}</cmd>`,
 		);
 		assert.equal(
 			ctxForLlm.agentStateMessages[0].content[0].text,
-			`cwd: ${require("node:fs").realpathSync(process.cwd())}`,
+			`cwd: <cmd source="pwd -P">${require("node:fs").realpathSync(process.cwd())}</cmd>`,
 		);
 	});
 
@@ -222,7 +222,7 @@ describe("user-message expansion path: LLM must see the expanded text, not the r
 				seen = llmCtx.messages.find((m) => m.role === "user")?.content?.[0]
 					?.text;
 			});
-			assert.equal(seen, "load: FROM-FILE");
+			assert.equal(seen, `load: <file path="${f}">FROM-FILE</file>`);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}

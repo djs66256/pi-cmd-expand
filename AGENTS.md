@@ -21,10 +21,10 @@ Code–compatible:
   more paths, language tag is optional and ignored)
 
 Inline file references resolve to a single file's content; fenced
-file references resolve to one or more files, each labeled with
-`=== path ===` in the inline output. Both forms recursively expand
-any further `` `@`path` `` / `` `!`cmd` `` / `!```...```` /
-`@```...```` found inside the loaded file, up to a depth cap of 10.
+file references resolve to one or more files, each in its own
+`<file path="…">…</file>` wrap. Both forms recursively expand any
+further `` `@`path` `` / `` `!`cmd` `` / `!```...```` / `@```...````
+found inside the loaded file, up to a depth cap of 10.
 
 Single TypeScript file (`src/index.ts`), default-exports a factory,
 registers two event handlers, nothing else.
@@ -79,23 +79,33 @@ extractUserText(event.message.content)
                                           # fenced wins within each class
   → for each match, right-to-left:
       command:  bashOps.exec(command, ctx.cwd, { onData, timeout })
-                → on failure:    partial output + "[command failed: …]"
-                → on success:    truncateTail(output, { maxBytes })
-                                   → on overflow: write full output to
-                                     /tmp/pi-cmd-expand-<hex>.log, append
-                                     "[Output truncated … Full output: <path>]"
+                  → CommandOutcome { output, exitCode, truncated, … }
+                → formatCmdWrap(outcome, command, lang)
+                   → <cmd source="<≤20-char source>" [lang="…"]
+                            [status="failed|truncated" exit-code|inline-size|total-size]>
+                      <output>
+                      </cmd>
       file:     loadFileRaw(path, ctx.cwd)
-                  → on error: "[file failed: ENOENT|EISDIR|…: …]"
-                  → on success: recursively expandText(content, …)
-                                 (depth+1, absPath added to visited set)
-                               → truncateTail(expanded, { maxBytes: FILE_CAP })
-                                  → on overflow: write expanded to temp file
-                  → format:  bare for inline (`@`path``),
-                             `=== path ===\n<content>` for fenced
+                  → FileOutcome { output, status, error?, … }
+                if status === "ok":
+                  newVisited = Set(visited) + absPath
+                  expandText(content, …, depth+1, newVisited)
+                    → produces expanded content with nested <cmd>/<file> wraps
+                  truncateTail(expanded, { maxBytes: FILE_CAP })
+                    → on overflow: write expanded to temp file, append
+                      "[Output truncated … Full output: <path>]"
+                → formatFileWrap(outcome, path)
+                   → <file path="…" [status="failed|circular|truncated"
+                                       error|inline-size|total-size]>
+                      <output>
+                      </file>
   → return { message: { ...event.message, content: [expandedText] } }
   → agent-session._replaceMessageInPlace mutates event.message in place
   → LLM (via currentContext.messages) sees the expanded text
 ```
+
+Every match becomes a `<cmd>` or `<file>` wrap; the original text
+outside matches (user prose, headings, etc.) is spliced unchanged.
 
 For context files, the same chain is wrapped in `expandFile()`
 (per-session `path + mtime + size` cache, so repeat turns do not
@@ -136,20 +146,32 @@ deep and they should restructure.
   The inline `` `@`path` `` regex uses a `(?<!\w)` lookbehind to
   avoid false positives on email-like text.
 - `runCommand(command, cwd, timeoutMs)` — wraps `bashOps.exec`,
-  returns a `CommandResult`. Failed commands bypass truncation.
+  returns a `CommandOutcome` (output, exitCode, truncated,
+  byte sizes). Failed commands bypass truncation.
 - `loadFileRaw(relPath, cwd)` — reads a file with `fs.readFile(path,
-  "utf-8")` and returns the raw content, or a `[file failed: …]`
-  string on error (never throws). Caller checks the prefix to
-  decide whether to recurse.
-- `truncateOrKeep(content, maxBytes)` — wraps `truncateTail` and
-  persists the full content to a temp file on overflow. Used for
-  both command output and expanded file content.
+  "utf-8")` and returns a `FileOutcome` (output, status
+  `"ok" | "failed"`, error?, …). Never throws — the status field
+  tells the caller whether to recurse.
+- `formatCmdWrap(outcome, command, lang)` — builds `<cmd source="…"
+  [lang="…"] [status="…" exit-code|inline-size|total-size]>…</cmd>`,
+  picking single-line vs multi-line wrapping based on body line count.
+- `formatFileWrap(outcome, path)` — builds `<file path="…" [status="…"
+  error|inline-size|total-size]>…</file>` with the same wrapping rule.
+- `quoteAttr(value)` — wraps a value in `"` (or `'` if it contains `"`).
+- `truncateSource(source)` — collapses to first line and truncates
+  to ≤ `SOURCE_MAX_CHARS` (20) with a trailing `...`.
+- `wrapWithTag(tagName, attrs, content)` — applies the
+  inline-vs-multi-line wrapping rule (trailing `\n` stripped).
 - `expandFileReferences(match, cwd, …, visited)` — loads each path
-  in a `FileMatch`, recursively expands the content, applies the
-  per-file cap, formats inline-vs-fenced output. Parallel reads.
+  in a `FileMatch`, recursively expands the content (which itself
+  produces wrapped output), applies the per-file cap, formats via
+  `formatFileWrap`. Parallel reads.
 - `expandText(text, cwd, …, depth, visited)` — the top-level
   splicer. Finds matches, walks right-to-left, dispatches to
-  `runCommand` (commands) or `expandFileReferences` (files).
+  `runCommand` (commands) or `expandFileReferences` (files). The
+  final splice of each match is the wrapped output, so the LLM sees
+  `<cmd>…</cmd>` / `<file>…</file>` blocks in place of the original
+  syntax.
 - `expandFile(filePath, original, cwd, …)` — `expandText` plus the
   per-session `path + mtime + size` cache (module-level `Map`).
 - `substituteInSystemPrompt(systemPrompt, filePath, original,
@@ -162,6 +184,26 @@ deep and they should restructure.
   `<CODE>: <message>` for `[file failed: …]`.
 - `writeFullOutput(text)` — writes the full content to
   `/tmp/pi-cmd-expand-<hex>.log` for the truncation footer.
+
+### Wrap format
+
+Every match is replaced with a `<cmd>` or `<file>` wrap carrying
+provenance (`source` for commands, `path` for files, optional
+`lang` for fenced commands) and outcome metadata (`status` +
+relevant attribute). Single-line content wraps inline; multi-line
+content wraps multi-line with open / close tags on their own lines.
+The body still contains the human-readable marker
+(`[command failed: …]`, `[file failed: …]`,
+`[Output truncated …]`, `[file skipped: circular reference: …]`)
+so the LLM can read both the structured attributes and the prose.
+
+For fenced multi-file (`` @```\npaths\n``` ``), each path gets its
+own `<file>` wrap; the wraps are joined with a blank line. There
+is no enclosing `<files>` wrapper.
+
+The `source` attribute on `<cmd>` is truncated to ≤ 20 characters
+(first line of a fenced body, `...` indicating further truncation).
+Paths on `<file>` are preserved verbatim.
 
 ## The scope contract (do not break this)
 
@@ -180,7 +222,7 @@ the extension registers, so a regression is caught at `npm test`.
 
 ## Configuration knobs
 
-All four are `const` at the top of `src/index.ts`:
+All five are `const` at the top of `src/index.ts`:
 
 | Constant                   | Default  | Effect                                                                                                                                                                                                                                            |
 | -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -188,6 +230,7 @@ All four are `const` at the top of `src/index.ts`:
 | `DEFAULT_MAX_OUTPUT_BYTES` | `2_000`  | Soft cap on inline command output. Above this, `truncateTail` keeps the last N bytes and the full output is written to a temp file whose path is appended inline so the LLM can `read` it on demand.                                                  |
 | `DEFAULT_MAX_FILE_BYTES`   | `10_000` | Soft cap on inline file content (after recursive expansion). Same truncation policy as commands; full expanded content is persisted to a temp file above this. Larger than the command cap because source files tend to be larger than command output. |
 | `MAX_RECURSION_DEPTH`      | `10`     | Hard cap on `` `@`path` `` nesting. Beyond this depth, `expandText` returns the file content with its `` `@`path` `` references still unexpanded. The LLM sees the unresolved syntax and can decide what to do (e.g., use `read`).                |
+| `SOURCE_MAX_CHARS`         | `20`     | Maximum length of the `source` attribute on `<cmd>` tags. Longer commands are truncated to first 17 chars + `...` (fenced commands use only their first line as the source). Full command still runs — only the visible provenance is short.        |
 
 Temp files are **not** auto-cleaned — they live in `os.tmpdir()`
 and the OS reclaims them on reboot.

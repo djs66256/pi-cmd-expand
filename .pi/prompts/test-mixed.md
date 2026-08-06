@@ -18,3 +18,7 @@ Run all three of these and report what each one printed.
 Expected:
 - (1) and (2) show their `OK_*` text.
 - (3) shows `before-fail` followed by a `[command failed: exit code 3]` line.
+- Each result is wrapped in a `<cmd source="…">…</cmd>` block:
+  - (1) inline wrap: `<cmd source="echo OK_INLINE">OK_INLINE</cmd>`
+  - (2) fenced wrap: `<cmd source="echo OK_FENCED" lang="sh">OK_FENCED</cmd>`
+  - (3) failed wrap: `<cmd source="..." status="failed" exit-code="3">before-fail\n[command failed: exit code 3]</cmd>`
