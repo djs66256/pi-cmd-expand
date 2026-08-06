@@ -129,16 +129,8 @@ Fenced (multi-file, one wrap per file):
 ## Configuration
 
 Both kinds of expansion can be turned on or off independently via a
-JSON config file. The two locations (project overrides global on a
-per-key basis):
-
-| Location                            | Scope                  |
-| ----------------------------------- | ---------------------- |
-| `~/.pi/agent/pi-cmd-expand.json`    | Global (all projects)  |
-| `./.pi/pi-cmd-expand.json`          | Project (this cwd)     |
-
-Schema — all keys optional, missing / wrong-typed / unknown keys fall
-back to defaults without throwing:
+JSON config file — `~/.pi/agent/pi-cmd-expand.json` (global) and
+`./.pi/pi-cmd-expand.json` (project, overrides global per key):
 
 ```json
 {
@@ -147,24 +139,10 @@ back to defaults without throwing:
 }
 ```
 
-| Key           | Default | Effect                                                                                                              |
-| ------------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
-| `enableCmd`   | `true`  | When `false`, `` !`cmd` `` / `` !```sh ` blocks are left as literal text in user messages and `AGENTS.md` / `CLAUDE.md`. The toggle applies at every expansion level, so `` !`cmd` `` inside a loaded file is also left literal. |
-| `enableFile`  | `true`  | When `false`, `` @`path` `` / `` @``` ` blocks are left as literal text in both user messages and context files. Same recursive semantics. |
-
-The file is read on session start (and again on `/reload`). Mid-session
-edits without `/reload` take effect on the next session. Parse errors
-are logged and ignored — defaults apply.
-
-Use cases:
-
-- **Disable cmd only**, keep `@`-files: leave commands as literal text
-  the LLM can read (and decide to run with the built-in `bash` tool,
-  preserving any safety affordances you've set up there), but still
-  inline context files.
-- **Disable file only**, keep `!`-cmds: pre-compute command snapshots
-  in a prompt template, but stop the extension from reading any file
-  the prompt references. Useful for tightly-controlled environments.
+Setting either to `false` leaves that syntax as literal text at every
+expansion level. The file is read on session start (and again on
+`/reload`); parse errors are logged and ignored. Full schema, precedence
+rules, and use cases: **[docs/configuration.md](./docs/configuration.md)**.
 
 ## Scope
 
@@ -181,92 +159,36 @@ The expansion rule is intentionally narrow:
 | Files the agent reads with `read`                 | ❌ only files explicitly referenced via `` @`path` `` |
 
 The `input` / `user_bash` / `tool_call` / `tool_result` hooks are
-deliberately left unregistered: `input` because the on-screen TUI
-cannot show the expanded text for the template-body case anyway, and
-centralising everything in `message_end` keeps both the typed and
-template paths on the same in-place rewrite contract; `user_bash` so
-pi's native `!bash` (with its `!!`, cancellation, and live-streaming
-semantics) keeps working untouched; `tool_call` / `tool_result` so
-the agent's own `bash` tool is not pre- or post-processed.
-
-> **Why one hook for user input?** The `message_end` event fires
-> *after* template / skill expansion but *before* the LLM call
-> (see [docs/extensions.md](https://pi.dev/docs/extensions#message_end)),
-> so the user message it sees already contains the
-> `` !`cmd` `` form whether the user typed it directly or it came
-> from a prompt-template / skill body. Rewriting it in place inside
-> `message_end` covers both cases with a single path. See
-> [AGENTS.md](./AGENTS.md) for the full rationale.
+deliberately left unregistered so pi's native `!bash` and the agent's
+own `bash` tool keep working untouched, and so typed and
+template-sourced input share a single in-place rewrite path in
+`message_end` (which fires *after* template / skill expansion but
+*before* the LLM call). Full rationale:
+**[docs/architecture.md](./docs/architecture.md#the-scope-contract-do-not-break-this)**.
 
 ## Behaviour
 
-- **Wrap format** — every expansion is wrapped in `<cmd>…</cmd>` or
-  `<file>…</file>`. Provenance is in the attributes (`source` for
-  commands, `path` for files, optional `lang` for fenced commands).
-  Outcome metadata (`status="failed" exit-code="N"`,
-  `status="truncated" inline-size=… total-size=…`,
-  `status="circular"`) is added when something goes wrong; the body
-  of the tag still contains the human-readable
-  `[command failed: …]` / `[file failed: …]` / `[Output truncated
-  …]` / `[file skipped: circular reference: …]` marker.
-  Single-line content wraps inline (`<cmd source="ls">AUTHORS</cmd>`);
-  multi-line content wraps multi-line with the tags on their own lines:
-  ```
-  <cmd source="ls -1">
-  AUTHORS
-  LICENSE
-  README.md
-  </cmd>
-  ```
-- **Failure handling** — a failing command becomes
-  `[command failed: exit code N]` inside the wrap (with stdout/stderr
-  above it when present); a missing file becomes
-  `[file failed: ENOENT: no such file or directory, open '/abs/path']`
-  inside the wrap; a circular `` @`path` `` chain becomes
-  `[file skipped: circular reference: ./foo.md]` inside the wrap. The
-  expansion never throws, so a broken  `` !`cmd` ``  or  `` @`path` ``
-  never aborts a turn.
-- **Truncation** — command output over 2 KB is tail-truncated in
-  place; file content over 10 KB is tail-truncated in place. In both
-  cases the full content is written to `/tmp/pi-cmd-expand-*.log`,
-  and the temp file path is appended inline as
-  `[Output truncated ... Full output: <path>]`, inside the wrap so
-  the LLM can read it on demand. Failed commands bypass truncation
-  so the diagnostic is preserved.
-- **Recursion** — a file loaded via `` @`path` `` is run through
-  the same expansion pipeline as the top-level text, up to a depth
-  cap of 10. Cycles are short-circuited with a per-chain visited
-  set. The depth cap is a safety net; in normal use, depth 1–3 is
-  plenty. Recursive expansion produces nested `<file>` tags (the
-  outer one is from the user's prompt; inner ones are from inside
-  the loaded file).
+- **Wrap format** — `<cmd source="…">` / `<file path="…">`, plus
+  `status` / `exit-code` / `error` / `inline-size` / `total-size` when
+  something goes wrong. Single-line content wraps inline, multi-line
+  content puts the tags on their own lines.
+- **Failure handling** — failures become `[command failed: …]` /
+  `[file failed: …]` / `[file skipped: circular reference: …]` inside
+  the wrap. The expansion never throws, so a broken reference never
+  aborts a turn.
+- **Truncation** — command output over 2 KB and file content over 10 KB
+  are tail-truncated; the full text is written to
+  `/tmp/pi-cmd-expand-*.log` and the path is appended inline.
+- **Recursion** — depth-capped at 10, cycles short-circuited.
 - **Caching** — context-file expansions are cached by
-  `path + mtime + size` within a session, so multi-turn sessions
-  don't re-run the same commands or re-read the same referenced
-  files every turn. Files loaded via `` @`path` `` inside a
-  context file are NOT individually cached — they're cached as part
-  of the containing file's expansion result, and re-read whenever
-  the containing file changes.
-- **Timeout** — 5 s per command. Slow commands are killed and
-  reported as `[command failed: timed out after 5000ms]` inside the
-  wrap.
-- **Shell** — commands run through pi's built-in
-  `createLocalBashOperations()`, so shell resolution (Git Bash on
-  Windows, WSL, `/bin/bash` on Unix, `sh` as fallback), output
-  sanitisation (ANSI strip, control-char filter, CR normalisation),
-  and process-tree cleanup on timeout are all inherited from pi's
-  native `bash` tool. `|`, `>`, `$VAR`, etc. work the way you'd
-  expect.
-- **Source truncation** — the `source` attribute on `<cmd>` tags is
-  truncated to ≤ 20 characters (first line of fenced body, with
-  `...` indicating further truncation). Long commands stay
-  executable; only the visible provenance is short.
-- **Email safety** — the inline `` @`path` `` regex uses a
-  `(?<!\w)` lookbehind so email-like text such as
-  `user@`example.com`` is NOT matched. `` @` `` after a word
-  character (alphanumeric / `_`) is left alone; `` @` `` at
-  start-of-string, after whitespace, or after punctuation still
-  triggers file loading.
+  `path + mtime + size` within a session.
+- **Timeout** — 5 s per command.
+- **Shell** — pi's built-in `createLocalBashOperations()`, so `|`, `>`,
+  `$VAR` and cross-platform shell resolution work as expected.
+- **Email safety** — `` user@`example.com` `` is not matched as a file
+  reference.
+
+Full details for each of these: **[docs/behaviour.md](./docs/behaviour.md)**.
 
 ## Develop
 
@@ -275,9 +197,9 @@ npm test                         # node --test, jiti-loaded TS
 npm test -- --test-reporter=spec # prettier output
 ```
 
-See **[AGENTS.md](./AGENTS.md)** for the full developer / agent guide
-(architecture, event hooks, the scope contract, configuration
-knobs, and common gotchas).
+See **[AGENTS.md](./AGENTS.md)** for the developer / agent guide, and
+**[docs/](./docs)** for architecture, internals, configuration, and
+behaviour references.
 
 ## Manual smoke tests
 
