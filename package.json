@@ -1,6 +1,6 @@
 {
 	"name": "pi-cmd-expand",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Expand !`cmd` and !```sh\\ncmd\\n``` inline command syntax in prompts and project context files (AGENTS.md / CLAUDE.md). Commands run in the agent's cwd.",
 	"keywords": [
 		"pi-package",
