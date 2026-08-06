@@ -1,35 +1,52 @@
 # pi-cmd-expand
 
-A [pi](https://pi.dev) extension that expands inline shell commands in
-your prompts and project context files **before** the agent sees them.
+A [pi](https://pi.dev) extension that expands inline shell commands and
+file references in your prompts and project context files **before** the
+agent sees them.
 
-Two forms are supported (Claude Code–compatible):
+Four forms are supported (Claude Code–compatible):
 
 ````text
 !`ls -la`
+@`path/to/file.md`
 ````
 
 `````text
 !```sh
 ls -la
 ```
+
+@```
+path/to/file_1
+path/to/file_2
+```
 `````
 
-The fenced form accepts an optional language tag. Common shell tags such as
-`sh`, `bash`, `shell`, `zsh`, and `fish` are all recognized; the tag is only
-syntax metadata and does not select the shell used for execution.
+The fenced forms accept an optional language tag. Common shell tags such as
+`sh`, `bash`, `shell`, `zsh`, and `fish` are all recognized for commands;
+the tag is only syntax metadata and does not select the shell used for
+execution. For `@``` ` the tag is ignored entirely.
 
 ## What it does
 
 - **`` `!`cmd` ``** anywhere in your typed message → the command runs in the
   agent's current working directory, and the output is spliced in
   before the agent sees the message.
-- **`` `!`cmd` ``** inside `AGENTS.md` / `CLAUDE.md` → the same expansion
-  happens at session start, so project-context files can include live
-  filesystem snapshots, package lists, diffs, etc.
+- **`` `@`path` ``** anywhere in your typed message → the file's UTF-8
+  contents are inlined before the agent sees the message. The path is
+  resolved against the agent's cwd; absolute paths are used verbatim.
+- **`` `!`cmd` ``** / **`` `@`path` ``** inside `AGENTS.md` / `CLAUDE.md` →
+  the same expansion happens at session start, so project-context files
+  can include live filesystem snapshots, package lists, diffs, **and
+  inlined source files**.
+- **Recursion** — a file loaded via `` `@`path` `` is itself run through
+  the same expansion rules, so any further `` `@`path` `` or `` `!`cmd` ``
+  inside it is also resolved (depth-capped at 10; cycles short-circuited
+  inline). This means a single `` `@`./README.md` `` can pull in a whole
+  doc tree in one go.
 
-All commands run in the **agent's cwd** (`ctx.cwd`) — never the
-directory of the prompt or the context file.
+All commands run and all file paths resolve against the **agent's cwd**
+(`ctx.cwd`) — never the directory of the prompt or the context file.
 
 ## Install
 
@@ -73,10 +90,21 @@ Tests:
 !```sh
 ls tests/ | head -10
 ```
+
+Entry point:
+@`./src/index.ts`
+
+Sibling docs:
+@```
+./README.md
+./CHANGELOG.md
+```
 `````
 
-…when pi loads it, the agent sees the real filesystem snapshot, taken
-in the agent's cwd.
+…when pi loads it, the agent sees the real filesystem snapshot (taken in
+the agent's cwd), the full contents of `src/index.ts` (recursively
+expanded if it itself contains `` `@`path` `` / `` `!`cmd` ``), and both
+`README.md` and `CHANGELOG.md` with `=== path ===` labels.
 
 ## Scope
 
@@ -84,12 +112,13 @@ The expansion rule is intentionally narrow:
 
 | Source                                            | Expanded?            |
 | ------------------------------------------------- | -------------------- |
-|  `` `!`cmd` ``  in a directly-typed message              | ✅ `message_end` (LLM only — the on-screen chat bubble shows the raw `` `!`cmd` `` form because pi does not re-render the user message on `message_end`) |
-|  `` `!`cmd` ``  inside a prompt template (`/foo`) or skill body | ✅ `message_end` (post-template expansion) |
-|  `` `!`cmd` ``  in `AGENTS.md` / `CLAUDE.md`             | ✅ `before_agent_start` |
+|  `` `!`cmd` ``  / `` `@`path` ``  in a directly-typed message   | ✅ `message_end` (LLM only — the on-screen chat bubble shows the raw form because pi does not re-render the user message on `message_end`) |
+|  `` `!`cmd` ``  / `` `@`path` ``  inside a prompt template (`/foo`) or skill body | ✅ `message_end` (post-template expansion) |
+|  `` `!`cmd` ``  / `` `@`path` ``  in `AGENTS.md` / `CLAUDE.md`             | ✅ `before_agent_start` |
+| `` `@`path` ``  chained inside a file loaded via `` `@`path` `` | ✅ recursive expansion (depth-capped at 10) |
 | `!cmd` at the start of a line                     | ❌ pi's native `!bash` |
 | Commands the LLM runs via its `bash` tool         | ❌ untouched         |
-| Files the agent reads with `read`                 | ❌ only project-context files |
+| Files the agent reads with `read`                 | ❌ only files explicitly referenced via `` `@`path` `` |
 
 The `input` / `user_bash` / `tool_call` / `tool_result` hooks are
 deliberately left unregistered: `input` because the on-screen TUI
@@ -113,17 +142,31 @@ the agent's own `bash` tool is not pre- or post-processed.
 
 - **Failure handling** — a failing command becomes
   `[command failed: exit code N]` inline (with stdout/stderr above it
-  when present). The expansion never throws, so a broken  `` `!`cmd` `` 
-  never aborts a turn.
+  when present); a missing file becomes
+  `[file failed: ENOENT: no such file or directory, open '/abs/path']`
+  inline; a circular `` `@`path` `` chain becomes
+  `[file skipped: circular reference: ./foo.md]` inline. The expansion
+  never throws, so a broken  `` `!`cmd` ``  or  `` `@`path` ``  never
+  aborts a turn.
 - **Truncation** — command output over 2 KB is tail-truncated in
-  place, the full output is written to `/tmp/pi-cmd-expand-*.log`,
+  place; file content over 10 KB is tail-truncated in place. In both
+  cases the full content is written to `/tmp/pi-cmd-expand-*.log`,
   and the temp file path is appended inline as
   `[Output truncated ... Full output: <path>]`, so the LLM can read
   it on demand. Failed commands bypass truncation so the diagnostic
   is preserved.
+- **Recursion** — a file loaded via `` `@`path` `` is run through
+  the same expansion pipeline as the top-level text, up to a depth
+  cap of 10. Cycles are short-circuited with a per-chain visited
+  set. The depth cap is a safety net; in normal use, depth 1–3 is
+  plenty.
 - **Caching** — context-file expansions are cached by
   `path + mtime + size` within a session, so multi-turn sessions
-  don't re-run the same commands every turn.
+  don't re-run the same commands or re-read the same referenced
+  files every turn. Files loaded via `` `@`path` `` inside a
+  context file are NOT individually cached — they're cached as part
+  of the containing file's expansion result, and re-read whenever
+  the containing file changes.
 - **Timeout** — 5 s per command. Slow commands are killed and
   reported as `[command failed: timed out after 5000ms]`.
 - **Shell** — commands run through pi's built-in
@@ -133,6 +176,12 @@ the agent's own `bash` tool is not pre- or post-processed.
   and process-tree cleanup on timeout are all inherited from pi's
   native `bash` tool. `|`, `>`, `$VAR`, etc. work the way you'd
   expect.
+- **Email safety** — the inline `` `@`path` `` regex uses a
+  `(?<!\w)` lookbehind so email-like text such as
+  `user@`example.com`` is NOT matched. `` `@` `` after a word
+  character (alphanumeric / `_`) is left alone; `` `@` `` at
+  start-of-string, after whitespace, or after punctuation still
+  triggers file loading.
 
 ## Develop
 
@@ -147,12 +196,13 @@ knobs, and common gotchas).
 
 ## Manual smoke tests
 
-`.pi/prompts/` ships 10 slash-commands (`/test-inline`,
-`/test-truncation`, `/test-scope`, …) for manually exercising each
-behaviour path against a real LLM turn. The `demo-*` ones are
-practical usage examples (git diff review, project layout snapshot).
-They are for humans running pi interactively — they are **not** run
-by `npm test`.
+`.pi/prompts/` ships 15 slash-commands (`/test-inline`,
+`/test-file-inline`, `/test-file-multi`, `/test-truncation`,
+`/test-scope`, …) for manually exercising each behaviour path
+against a real LLM turn. The `demo-*` ones are practical usage
+examples (git diff review, project layout snapshot). They are for
+humans running pi interactively — they are **not** run by
+`npm test`.
 
 ## License
 

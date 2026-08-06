@@ -2,34 +2,47 @@
 
 一个 [pi](https://pi.dev) 插件，用于在 prompt 和项目上下文文件
 （AGENTS.md / CLAUDE.md）**送到 agent 之前**展开其中的内联 shell
-命令。
+命令和文件引用。
 
-支持两种语法（与 Claude Code 兼容）：
+支持四种语法（与 Claude Code 兼容）：
 
 ````text
 !`ls -la`
+@`path/to/file.md`
 ````
 
 `````text
 !```sh
 ls -la
 ```
+
+@```
+path/to/file_1
+path/to/file_2
+```
 `````
 
-fenced 形式的语言标签是可选的。常见的 shell 标签（例如 `sh`、`bash`、
-`shell`、`zsh`、`fish`）都能识别；标签只是语法元数据，不会决定实际执行命令
-时使用的 shell。
+fenced 形式的语言标签是可选的。命令形式的 shell 标签（例如 `sh`、
+`bash`、`shell`、`zsh`、`fish`）都能识别；标签只是语法元数据，不会决定
+实际执行命令时使用的 shell。`` @``` `` 形式的语言标签会被忽略。
 
 ## 作用
 
 - 用户输入消息中任意位置的 **`` `!`cmd` ``** → 命令在 agent 当前工作
   目录下执行，输出就地拼接进消息，agent 看到的就是替换后的文本。
-- **`AGENTS.md` / `CLAUDE.md`** 中的 **`` `!`cmd` ``** → 在会话开始时
-  展开同一规则，所以项目上下文里可以直接放实时的文件快照、
-  package 列表、diff 等等。
+- 用户输入消息中任意位置的 **`` `@`path` ``** → 文件的 UTF-8 内容就地
+  拼进消息，agent 看到的就是替换后的文本。路径以 agent 的 cwd 为基准
+  解析，绝对路径则原样使用。
+- **`AGENTS.md` / `CLAUDE.md`** 中的 **`` `!`cmd` ``** / **`` `@`path` ``**
+  → 在会话开始时展开同一规则，所以项目上下文里可以直接放实时的文件
+  快照、package 列表、diff，**以及内联的源文件**。
+- **递归加载** — 通过 `` `@`path` `` 加载的文件本身也会走同一套展开
+  规则，里面的 `` `@`path` `` 或 `` `!`cmd` `` 也会被解析（深度上限
+  10；环引用会被短路）。所以一条 `` `@`./README.md` `` 可以一次性把
+  整棵文档树拉进上下文。
 
-所有命令都在 **agent 的 cwd**（`ctx.cwd`）中执行，而不是 prompt
-或上下文文件所在目录。
+所有命令执行和文件路径解析都以 **agent 的 cwd**（`ctx.cwd`）为基准，
+不是 prompt 或上下文文件所在目录。
 
 ## 安装
 
@@ -71,10 +84,21 @@ pi -e npm:pi-cmd-expand
 !```sh
 ls tests/ | head -10
 ```
+
+入口：
+@`./src/index.ts`
+
+姊妹文档：
+@```
+./README.md
+./CHANGELOG.md
+```
 `````
 
 pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件系统
-快照。
+快照、`src/index.ts` 的完整内容（如果它内部还包含 `` `@`path` `` /
+`` `!`cmd` `` 会被递归展开），以及带 `=== path ===` 标头的 `README.md`
+和 `CHANGELOG.md`。
 
 ## 作用范围
 
@@ -82,12 +106,13 @@ pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件�
 
 | 来源 | 是否展开 |
 | --- | --- |
-| 用户直接敲的  `` `!`cmd` ``  | ✅ `message_end` 事件（LLM 能看到展开后文本；TUI 聊天区的 user message 气泡仍然显示 `!`cmd` 源码，因为 pi 在 `message_end` 不重渲染 user 消息） |
-| prompt 模板（`/foo`）或 skill（`/skill:bar`）正文里的  `` `!`cmd` ``  | ✅ `message_end` 事件（template 展开之后） |
-| `AGENTS.md` / `CLAUDE.md` 中的  `` `!`cmd` ``  | ✅ `before_agent_start` 事件 |
+| 用户直接敲的  `` `!`cmd` ``  /  `` `@`path` ``  | ✅ `message_end` 事件（LLM 能看到展开后文本；TUI 聊天区的 user message 气泡仍然显示源码，因为 pi 在 `message_end` 不重渲染 user 消息） |
+| prompt 模板（`/foo`）或 skill（`/skill:bar`）正文里的  `` `!`cmd` ``  /  `` `@`path` ``  | ✅ `message_end` 事件（template 展开之后） |
+| `AGENTS.md` / `CLAUDE.md` 中的  `` `!`cmd` ``  /  `` `@`path` ``  | ✅ `before_agent_start` 事件 |
+| 通过 `` `@`path` `` 加载的文件内部再出现 `` `@`path` ``  | ✅ 递归展开（深度上限 10） |
 | 行首的 `!cmd` | ❌ pi 原生的 `!bash` |
 | LLM 通过 `bash` 工具执行的命令 | ❌ 不动 |
-| agent 用 `read` 工具读的文件 | ❌ 只有项目上下文文件会被展开 |
+| agent 用 `read` 工具读的文件 | ❌ 只有显式通过 `` `@`path` `` 引用的文件会被展开 |
 
 `input` / `user_bash` / `tool_call` / `tool_result` 这四个钩子**故意不**注册：`input` 是因为 TUI 对 template-body 场景本来就显示不出展开后文本，集中到 `message_end` 后直接键入和模板体两条路径走同一套 in-place 重写协议；`user_bash` 是为了 pi 原生的 `!bash`（含 `!!`、取消、实时流式）保持原样；`tool_call` / `tool_result` 是为了 agent 自带的 `bash` 工具不被提前展开。
 
@@ -102,14 +127,24 @@ pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件�
 
 - **失败处理** — 失败的命令就地标注为
   `[command failed: exit code N]`（如有 stdout/stderr 会在错误信息
-  上方一并保留）。展开过程永远不会抛异常，所以一个坏掉的  `` `!`cmd` `` 
-  不会让整轮中断。
-- **输出截断** — 单条命令输出超过 2 KB 会被尾部截断，完整输出
-  写到 `/tmp/pi-cmd-expand-*.log`，路径会作为
+  上方一并保留）；找不到的文件就地标注为
+  `[file failed: ENOENT: no such file or directory, open '/abs/path']`；
+  `` `@`path` `` 出现环引用时则就地标注为
+  `[file skipped: circular reference: ./foo.md]`。展开过程永远不会
+  抛异常，所以一个坏掉的  `` `!`cmd` ``  或  `` `@`path` ``  不会让
+  整轮中断。
+- **输出截断** — 单条命令输出超过 2 KB 会被尾部截断，文件内容
+  超过 10 KB 会被尾部截断，完整内容写到
+  `/tmp/pi-cmd-expand-*.log`，路径会作为
   `[Output truncated ... Full output: <path>]` 追加到插入文本里，
   LLM 可按需读取。失败的命令不走截断，保留诊断信息。
+- **递归加载** — 通过 `` `@`path` `` 加载的文件会走和顶层文本同样
+  的展开管线，深度上限 10。环引用通过 per-chain visited set 短路。
+  深度上限只是一个安全网，正常使用 1–3 层就够了。
 - **缓存** — 上下文文件展开按 `path + mtime + size` 缓存在当前
-  会话内，多轮对话中不会重复执行。
+  会话内，多轮对话中不会重复执行命令或重新读取同样的文件。被
+  `` `@`path` `` 加载进来的文件**不会**单独缓存——它们是作为包含
+  文件展开结果的一部分被缓存的，只在包含文件变化时重新读取。
 - **超时** — 每条命令 5 秒。慢命令会被杀，标注为
   `[command failed: timed out after 5000ms]`。
 - **Shell** — 通过 pi 内置的 `createLocalBashOperations()` 执行，
@@ -117,6 +152,10 @@ pi 加载它之后，agent 看到的就是 agent 工作目录下真实的文件�
   `sh` 兜底）、输出清理（去 ANSI、控制字符、CR 归一化）、超时杀
   整棵进程树都是直接复用 pi `bash` 工具的能力。`|`、`>`、`$VAR`
   都能正常工作。
+- **邮箱安全** — 内联 `` `@`path` `` 用了 `(?<!\w)` lookbehind，
+  所以邮件式文本（如 `` user@`example.com` ``）不会被误匹配。
+  紧跟单词字符（字母数字 / `_`）后的 `` `@` `` 不会被匹配；位于
+  字符串开头、空格之后、标点之后的 `` `@` `` 仍会触发文件加载。
 
 ## 开发
 
@@ -130,10 +169,11 @@ npm test -- --test-reporter=spec # 更可读的输出
 
 ## 手动验证 prompt
 
-`.pi/prompts/` 下有 10 个 slash-command（`/test-inline`、
-`/test-truncation`、`/test-scope` 等），在 pi 交互模式里调用可以
-手动检查每个行为路径。`demo-*` 是真实使用场景示例（git diff
-评审、项目结构快照）。这些**不**被 `npm test` 运行。
+`.pi/prompts/` 下有 15 个 slash-command（`/test-inline`、
+`/test-file-inline`、`/test-file-multi`、`/test-truncation`、
+`/test-scope` 等），在 pi 交互模式里调用可以手动检查每个行为
+路径。`demo-*` 是真实使用场景示例（git diff 评审、项目结构
+快照）。这些**不**被 `npm test` 运行。
 
 ## License
 

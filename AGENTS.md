@@ -9,11 +9,22 @@ Developer / AI-agent guide for **pi-cmd-expand**.
 ## What this project is
 
 A [pi](https://pi.dev) extension that expands inline shell-command
-syntax in prompts and project context files before the agent sees
-them. Two forms are supported, both Claude Code–compatible:
+and file-reference syntax in prompts and project context files
+before the agent sees them. Four forms are supported, all Claude
+Code–compatible:
 
--  `` `!`cmd` ``  (inline)
-- `!```lang\ncmd\n```\n` (fenced; language tag is optional)
+-  `` `!`cmd` ``  (inline command)
+- `!```lang\ncmd\n```\n` (fenced command; language tag is optional)
+- `` `@`path/to/file` ``  (inline file reference; backtick-delimited
+  so paths with spaces work)
+- `@```lang\npath1\npath2\n```\n` (fenced file reference; one or
+  more paths, language tag is optional and ignored)
+
+Inline file references resolve to a single file's content; fenced
+file references resolve to one or more files, each labeled with
+`=== path ===` in the inline output. Both forms recursively expand
+any further `` `@`path` `` / `` `!`cmd` `` / `!```...```` /
+`@```...```` found inside the loaded file, up to a depth cap of 10.
 
 Single TypeScript file (`src/index.ts`), default-exports a factory,
 registers two event handlers, nothing else.
@@ -56,40 +67,90 @@ dep, so invoke via `npx biome`.
 
 | Event                | What it does                                                                                                                                                                                                          |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `message_end`        | Rewrites `!`cmd`` in the final user message (post-template / post-skill expansion) in place before the LLM call. The same path covers both directly-typed and template-sourced input — there is no earlier hook that can see template bodies. |
-| `before_agent_start` | Walks `event.systemPromptOptions.contextFiles`, expands each `AGENTS.md` / `CLAUDE.md` block, and substitutes the expanded content into the system prompt's `<project_instructions path="…">` block. This is the only pi event that exposes both the system prompt string AND the structured `contextFiles` list. |
+| `message_end`        | Rewrites `!`cmd`` / `` @`path` `` / their fenced forms in the final user message (post-template / post-skill expansion) in place before the LLM call. The same path covers both directly-typed and template-sourced input — there is no earlier hook that can see template bodies. |
+| `before_agent_start` | Walks `event.systemPromptOptions.contextFiles`, expands each `AGENTS.md` / `CLAUDE.md` block (with both `!`cmd`` and `` @`path` `` resolved, recursively), and substitutes the expanded content into the system prompt's `<project_instructions path="…">` block. This is the only pi event that exposes both the system prompt string AND the structured `contextFiles` list. |
 
-### Data flow (per  `` `!`cmd` ``  occurrence)
+### Data flow (per  `` `!`cmd` ``  /  `` `@`path` ``  occurrence)
 
 ```
 extractUserText(event.message.content)
-  → findCommandMatches(text)                 # fenced first, then inline
+  → findAllMatches(text)                  # fenced-first, then inline;
+                                          # `!` and `@` handled separately,
+                                          # fenced wins within each class
   → for each match, right-to-left:
-      bashOps.exec(command, ctx.cwd, { onData, timeout })
-      → on failure:    partial output + "[command failed: …]"
-      → on success:    truncateTail(output, { maxBytes })
-                         → on overflow: write full output to
-                           /tmp/pi-cmd-expand-<hex>.log, append
-                           "[Output truncated … Full output: <path>]"
+      command:  bashOps.exec(command, ctx.cwd, { onData, timeout })
+                → on failure:    partial output + "[command failed: …]"
+                → on success:    truncateTail(output, { maxBytes })
+                                   → on overflow: write full output to
+                                     /tmp/pi-cmd-expand-<hex>.log, append
+                                     "[Output truncated … Full output: <path>]"
+      file:     loadFileRaw(path, ctx.cwd)
+                  → on error: "[file failed: ENOENT|EISDIR|…: …]"
+                  → on success: recursively expandText(content, …)
+                                 (depth+1, absPath added to visited set)
+                               → truncateTail(expanded, { maxBytes: FILE_CAP })
+                                  → on overflow: write expanded to temp file
+                  → format:  bare for inline (`@`path``),
+                             `=== path ===\n<content>` for fenced
   → return { message: { ...event.message, content: [expandedText] } }
   → agent-session._replaceMessageInPlace mutates event.message in place
   → LLM (via currentContext.messages) sees the expanded text
 ```
 
 For context files, the same chain is wrapped in `expandFile()`
-(per-session `path + mtime + size` cache) and
-`substituteInSystemPrompt()` (regex-substitutes the
+(per-session `path + mtime + size` cache, so repeat turns do not
+re-execute) and `substituteInSystemPrompt()` (regex-substitutes the
 `<project_instructions>` body).
+
+### Recursion in detail
+
+A file loaded via `` `@`path` `` is run through the same expansion
+pipeline as the top-level text. This is what lets a single
+`` `@`./CLAUDE.md` `` pull in a whole doc tree.
+
+Three guards keep this safe:
+
+1. **Depth cap (`MAX_RECURSION_DEPTH = 10`).** Beyond the cap,
+   `expandText` returns the file content with whatever `` `@`path` ``
+   references it still contains unexpanded. The LLM sees the
+   unresolved syntax and can decide what to do (e.g., use `read`).
+2. **Visited set.** Each `expandText` call accepts a `visited:
+   Set<string>` of absolute paths. When loading a file, the file's
+   own abs path is added; if a nested reference hits the same path
+   again, the load is short-circuited with
+   `[file skipped: circular reference: …]` rather than looping.
+3. **Per-parallel-task copy.** In `expandFileReferences`, file reads
+   are parallelized with `Promise.all`. Each task gets its own
+   `Set(visited)` so the shared set is never mutated mid-flight.
+
+The depth cap is a safety net, not a target — in normal use, depth
+1–3 is plenty. If a user hits the cap, their reference graph is too
+deep and they should restructure.
 
 ### Helpers (in `src/index.ts`)
 
-- `findCommandMatches(text)` — fenced first, then inline; inline
-  matches inside a fenced body are skipped.
+- `findAllMatches(text)` — finds `!`cmd``, `!```sh\ncmd\n```,
+  `` `@`path` ``, `@```\npaths\n``` `. Fenced first, then inline;
+  within each character class (`!` vs `@`), fenced wins; inline
+  matches inside any fenced range (of either class) are skipped.
+  The inline `` `@`path` `` regex uses a `(?<!\w)` lookbehind to
+  avoid false positives on email-like text.
 - `runCommand(command, cwd, timeoutMs)` — wraps `bashOps.exec`,
   returns a `CommandResult`. Failed commands bypass truncation.
-- `expandText(text, cwd, timeoutMs)` — finds all matches, executes
-  right-to-left, splices outputs back.
-- `expandFile(path, content, cwd, timeoutMs)` — `expandText` plus
+- `loadFileRaw(relPath, cwd)` — reads a file with `fs.readFile(path,
+  "utf-8")` and returns the raw content, or a `[file failed: …]`
+  string on error (never throws). Caller checks the prefix to
+  decide whether to recurse.
+- `truncateOrKeep(content, maxBytes)` — wraps `truncateTail` and
+  persists the full content to a temp file on overflow. Used for
+  both command output and expanded file content.
+- `expandFileReferences(match, cwd, …, visited)` — loads each path
+  in a `FileMatch`, recursively expands the content, applies the
+  per-file cap, formats inline-vs-fenced output. Parallel reads.
+- `expandText(text, cwd, …, depth, visited)` — the top-level
+  splicer. Finds matches, walks right-to-left, dispatches to
+  `runCommand` (commands) or `expandFileReferences` (files).
+- `expandFile(filePath, original, cwd, …)` — `expandText` plus the
   per-session `path + mtime + size` cache (module-level `Map`).
 - `substituteInSystemPrompt(systemPrompt, filePath, original,
   expanded)` — swaps the `<project_instructions>` body iff it
@@ -97,7 +158,9 @@ For context files, the same chain is wrapped in `expandFile()`
 - `describeExecError(err, timeoutMs)` — maps `bashOps.exec` error
   shapes (`timeout:N`, `Working directory does not exist:…`) into
   the byte-compatible `[command failed: …]` format.
-- `writeFullOutput(text)` — writes the full output to
+- `describeFileError(err)` — formats a Node FS error as
+  `<CODE>: <message>` for `[file failed: …]`.
+- `writeFullOutput(text)` — writes the full content to
   `/tmp/pi-cmd-expand-<hex>.log` for the truncation footer.
 
 ## The scope contract (do not break this)
@@ -117,12 +180,14 @@ the extension registers, so a regression is caught at `npm test`.
 
 ## Configuration knobs
 
-Both are `const` at the top of `src/index.ts`:
+All four are `const` at the top of `src/index.ts`:
 
 | Constant                   | Default  | Effect                                                                                                                                                                                                                                            |
 | -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DEFAULT_TIMEOUT_MS`       | `5_000`  | Per-command timeout. On expiry, partial output (if any) is reported inline followed by `[command failed: timed out after 5000ms]`.                                                                                                                |
-| `DEFAULT_MAX_OUTPUT_BYTES` | `2_000`  | Soft cap on inline output. Above this, `truncateTail` keeps the last N bytes and the full output is written to a temp file whose path is appended inline so the LLM can `read` it on demand.                                                  |
+| `DEFAULT_TIMEOUT_MS`       | `5_000`  | Per-command timeout. On expiry, partial output (if any) is reported inline followed by `[command failed: timed out after 5000ms]`. Applies to commands executed inside any loaded file as well.                                                  |
+| `DEFAULT_MAX_OUTPUT_BYTES` | `2_000`  | Soft cap on inline command output. Above this, `truncateTail` keeps the last N bytes and the full output is written to a temp file whose path is appended inline so the LLM can `read` it on demand.                                                  |
+| `DEFAULT_MAX_FILE_BYTES`   | `10_000` | Soft cap on inline file content (after recursive expansion). Same truncation policy as commands; full expanded content is persisted to a temp file above this. Larger than the command cap because source files tend to be larger than command output. |
+| `MAX_RECURSION_DEPTH`      | `10`     | Hard cap on `` `@`path` `` nesting. Beyond this depth, `expandText` returns the file content with its `` `@`path` `` references still unexpanded. The LLM sees the unresolved syntax and can decide what to do (e.g., use `read`).                |
 
 Temp files are **not** auto-cleaned — they live in `os.tmpdir()`
 and the OS reclaims them on reboot.
@@ -145,25 +210,45 @@ From `@earendil-works/pi-coding-agent`:
   end so earlier byte offsets stay valid. If you change the
   iteration order, recompute `start`/`end` from the mutated `out`
   string instead.
-- **Fenced has priority over inline.** `findCommandMatches`
-  collects fenced ranges first; inline matches whose `start`/`end`
-  fall inside a fenced range are skipped. Outer / longer forms
-  first — if you add a new form, follow the same priority.
+- **Fenced has priority over inline.** `findAllMatches` collects
+  fenced ranges first (of either class); inline matches whose
+  `start`/`end` fall inside any fenced range are skipped. Outer /
+  longer forms first — if you add a new form, follow the same
+  priority.
+- **`!` and `@` don't interfere.** An inline `!`cmd`` inside a
+  fenced `` `@`path` `` block is just text in the path list; an
+  inline `` `@`path` `` inside a fenced `!```sh\ncmd\n``` ` block is
+  just text in the shell script. Cross-character class interaction
+  only happens via the fenced-skip rule (an inline of either class
+  inside a fenced range of either class is skipped).
+- **`(?<!\w)` lookbehind on inline `` `@`path` ``.** This avoids
+  false positives on email-like text (`user@`example.com`` — the
+  `r` before `@` excludes it). If you remove it, emails get matched
+  as file paths. `` `@` `` at start-of-string, after whitespace, or
+  after punctuation still triggers.
 - **Failed commands bypass truncation.** Non-zero exit / thrown
   error returns the full partial output + a `[command failed: …]`
-  note, no temp file. Truncation would only obscure the
-  diagnostic.
+  note, no temp file. Truncation would only obscure the diagnostic.
+- **File errors never throw.** `loadFileRaw` returns the error as
+  a `[file failed: …]` string, so a missing or unreadable file
+  always reaches the LLM inline rather than aborting the turn.
 - **TUI does not re-render the user message on `message_end`.**
   `interactive-mode.js` adds the user message to the chat in
   `message_start` and `break`s for `message_end` on the user
-  role. Our handler rewrites `event.message.content` in place
-  for the LLM, but the on-screen chat bubble keeps showing the
-  raw `` !`cmd` ``. This is a pi design gap — not something the
-  extension can paper over from inside `message_end`.
+  role. Our handler rewrites `event.message.content` in place for
+  the LLM, but the on-screen chat bubble keeps showing the raw
+  `` !`cmd` `` / `` @`path` ``. This is a pi design gap — not
+  something the extension can paper over from inside `message_end`.
+- **Recursive temp files can be large.** When `` `@`A`` `` loads a
+  file whose expansion is large (or whose expansion pulls in more
+  large files), the temp file written by `truncateOrKeep` contains
+  the FULL expanded content (with all nested refs resolved). The
+  per-file cap still bounds the inline view, but the temp file is
+  unbounded by design — the user explicitly asked for these refs.
 
 ## Manual smoke tests
 
 `.pi/prompts/*.md` are slash-commands (`/test-truncation`,
-`/test-scope`, `/demo-review`, …) for manually exercising each
-behaviour path against a real LLM turn. They are **not** run by
-`npm test`.
+`/test-scope`, `/test-file-inline`, `/test-file-recursive`,
+`/demo-review`, …) for manually exercising each behaviour path
+against a real LLM turn. They are **not** run by `npm test`.

@@ -1,27 +1,34 @@
 /**
  * pi-cmd-expand
  *
- * Expand inline command syntax in prompts and project context files
- * (AGENTS.md / CLAUDE.md) before the agent sees them.
+ * Expand inline command and file-reference syntax in prompts and
+ * project context files (AGENTS.md / CLAUDE.md) before the agent
+ * sees them. Two pairs of forms are supported, all Claude
+ * Code-compatible:
  *
- * Supported syntax (Claude Code-compatible):
- *
- *   !`ls -la`
- *   !```sh
+ *   !`ls -la`              -- inline shell command
+ *   !```sh                 -- fenced shell command (multi-line)
  *   ls -la
  *   ```
+ *   @`path/to/file`        -- inline file reference (one file)
+ *   @```                   -- fenced file reference (one or more files)
+ *   path/to/file_1
+ *   path/to/file_2
+ *   ```
  *
- * All commands execute in the agent's current working directory
- * (ctx.cwd), not the directory of the prompt / context file.
+ * Both commands and file references resolve against the agent's
+ * current working directory (ctx.cwd), never against the directory
+ * of the prompt or context file.
  *
  * - For user input: hooks the `message_end` event and transforms the
- *   text in place. Works for both directly-typed `!`cmd`` and for
- *   `!`cmd`` that lives inside a prompt template / skill body
- *   (the body lands in the user message *after* template expansion,
+ *   text in place. Works for both directly-typed `!`cmd`` / `` @`path` ``
+ *   and for the same syntax that lives inside a prompt template / skill
+ *   body (the body lands in the user message *after* template expansion,
  *   so a pre-expansion `input` hook never sees it).
  *
  * Expansion runs once per unique file content (cached by path + mtime)
- * so repeat turns do not re-execute the same shell commands.
+ * so repeat turns do not re-execute the same shell commands or
+ * re-read the same referenced files.
  *
  * Command execution is delegated to pi's built-in
  * `createLocalBashOperations()`, so we inherit the same shell
@@ -31,19 +38,24 @@
  * rest of pi uses. This keeps behaviour aligned with pi's built-in
  * `bash` tool.
  *
- * Truncation is also delegated to pi's `truncateTail`: when a
- * command's output exceeds `DEFAULT_MAX_OUTPUT_BYTES`, we keep the
- * last N bytes and persist the full output to a temp file. The temp
+ * File reading uses plain `fs.readFile(path, "utf-8")`. A loaded file
+ * is recursively expanded the same way the top-level text is: any
+ * `` !`cmd` `` / `!```sh\ncmd\n``` ` / `` @`path` `` / `@```\npaths\n``` `
+ * inside the loaded content is also resolved, up to a recursion-depth
+ * cap (10). Cycles are short-circuited with a per-chain visited set.
+ *
+ * Truncation is also delegated to pi's `truncateTail`: when a command's
+ * output or a file's expanded content exceeds its cap, we keep the
+ * last N bytes and persist the full content to a temp file. The temp
  * file path is surfaced inline (so the LLM can read it) in the
- * spliced text. There is no separate `BashResult` UI affordance
- * because the extension does not own the `user_bash` event.
+ * spliced text.
  */
 
 import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	createLocalBashOperations,
 	type ExtensionAPI,
@@ -52,17 +64,42 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_TIMEOUT_MS = 5_000;
-/** Soft cap on inline-command output. Beyond this we tail-truncate and
+/** Soft cap on inline command output. Beyond this we tail-truncate and
  *  persist the full output to a temp file. */
 const DEFAULT_MAX_OUTPUT_BYTES = 2_000;
+/** Soft cap on inline file content. Same truncation policy as
+ *  commands; full content is persisted to a temp file above this.
+ *  Defaults larger than commands because source files tend to be
+ *  larger than typical command output. */
+const DEFAULT_MAX_FILE_BYTES = 10_000;
+/** Hard cap on how deeply `@` references may nest. With this cap,
+ *  even a chain of `a → b → c → …` references has a bounded worst
+ *  case; the visited-set additionally short-circuits actual cycles
+ *  long before the cap is reached. */
+const MAX_RECURSION_DEPTH = 10;
 
 const bashOps = createLocalBashOperations();
 
 interface CommandMatch {
 	start: number;
 	end: number;
+	kind: "command";
 	command: string;
 }
+
+interface FileMatch {
+	start: number;
+	end: number;
+	kind: "file";
+	/** One entry for inline, one-or-more for fenced. Blank lines
+	 *  inside fenced bodies are skipped. */
+	paths: string[];
+	/** True for `@```...``` `, false for `` @`path` ``. Controls
+	 *  whether each path gets a `=== path ===` header in the output. */
+	fenced: boolean;
+}
+
+type Match = CommandMatch | FileMatch;
 
 /** What a single `!cmd` invocation produces, ready to splice in. */
 interface CommandResult {
@@ -71,29 +108,63 @@ interface CommandResult {
 	output: string;
 }
 
-/** Find all !`cmd` and !```lang\ncmd\n``` occurrences in `text`. */
-function findCommandMatches(text: string): CommandMatch[] {
-	const matches: CommandMatch[] = [];
+/** Find all `!`cmd`` / `!```sh\ncmd\n``` ` / `` @`path` `` /
+ *  `@```\npaths\n``` ` occurrences in `text`. Within each character
+ *  class (`!` or `@`), fenced takes priority over inline; the two
+ *  character classes do not interfere with each other (an inline
+ *  `!` inside a fenced `@` block, or vice-versa, is just text). */
+function findAllMatches(text: string): Match[] {
+	const matches: Match[] = [];
+	/** Fenced ranges of either class. Inline matches (of either class)
+	 *  inside any fenced range are skipped — the fenced body is opaque
+	 *  to further inline expansion. */
+	const fencedRanges: Array<[number, number]> = [];
 
-	// Fenced form: !```lang\ncmd\n```  (lang is optional)
-	// The body must not itself contain a closing ``` on its own line.
-	const fencedRe = /!```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
-	for (const m of text.matchAll(fencedRe)) {
-		matches.push({
-			start: m.index ?? 0,
-			end: (m.index ?? 0) + m[0].length,
-			command: m[2],
-		});
-	}
-
-	// Inline form: !`cmd`  (no newlines, no nested backticks)
-	const inlineRe = /!`([^`\n]+)`/g;
-	for (const m of text.matchAll(inlineRe)) {
+	// Fenced command: !```lang\ncmd\n```  (lang is optional)
+	const cmdFencedRe = /!```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
+	for (const m of text.matchAll(cmdFencedRe)) {
 		const start = m.index ?? 0;
 		const end = start + m[0].length;
-		// Skip if this inline is inside an already-collected fenced block
-		if (matches.some((mm) => start >= mm.start && end <= mm.end)) continue;
-		matches.push({ start, end, command: m[1] });
+		matches.push({ start, end, kind: "command", command: m[2] });
+		fencedRanges.push([start, end]);
+	}
+
+	// Fenced file reference: @```lang\npaths\n```
+	const fileFencedRe = /@```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
+	for (const m of text.matchAll(fileFencedRe)) {
+		const start = m.index ?? 0;
+		const end = start + m[0].length;
+		matches.push({
+			start,
+			end,
+			kind: "file",
+			paths: m[2].split("\n"),
+			fenced: true,
+		});
+		fencedRanges.push([start, end]);
+	}
+
+	// Inline command: !`cmd`
+	const cmdInlineRe = /!`([^`\n]+)`/g;
+	for (const m of text.matchAll(cmdInlineRe)) {
+		const start = m.index ?? 0;
+		const end = start + m[0].length;
+		if (fencedRanges.some(([s, e]) => start >= s && end <= e)) continue;
+		matches.push({ start, end, kind: "command", command: m[1] });
+	}
+
+	// Inline file reference: @`path`  (no newlines, no nested backticks).
+	// The `(?<!\w)` lookbehind refuses to match when `@` is preceded by a
+	// word character, which avoids false positives on email-like text
+	// such as `user@`example.com`` (the `r` before `@` excludes it).
+	// `@` at start-of-string, after whitespace, or after punctuation
+	// still matches.
+	const fileInlineRe = /(?<!\w)@`([^`\n]+)`/g;
+	for (const m of text.matchAll(fileInlineRe)) {
+		const start = m.index ?? 0;
+		const end = start + m[0].length;
+		if (fencedRanges.some(([s, e]) => start >= s && end <= e)) continue;
+		matches.push({ start, end, kind: "file", paths: [m[1]], fenced: false });
 	}
 
 	matches.sort((a, b) => a.start - b.start);
@@ -121,6 +192,16 @@ function describeExecError(err: unknown, timeoutMs: number): string {
 	// exist. Preserve the original message verbatim.
 	if (err.message.startsWith("Working directory does not exist:")) {
 		return err.message;
+	}
+	return err.message || "unknown error";
+}
+
+/** Format a Node-style FS error as a one-line `[file failed: …]` body. */
+function describeFileError(err: unknown): string {
+	if (!(err instanceof Error)) return String(err) || "unknown error";
+	const code = (err as NodeJS.ErrnoException).code;
+	if (typeof code === "string" && code) {
+		return `${code}: ${err.message}`;
 	}
 	return err.message || "unknown error";
 }
@@ -198,32 +279,140 @@ async function runCommand(
 	return { output: truncation.content + footer };
 }
 
+/** Resolve `relPath` against `cwd`; absolute paths are used verbatim. */
+function resolveFilePath(relPath: string, cwd: string): string {
+	return isAbsolute(relPath) ? relPath : resolve(cwd, relPath);
+}
+
 /**
- * Replace every `!`...`` / `!```...```` occurrence in `text` with the
- * captured output of running the enclosed command in `cwd`. Returns the
- * spliced text plus aggregate truncation metadata so callers like
- * `user_bash` can surface it to pi's UI.
+ * Read `relPath` (resolved against `cwd`) and return its raw UTF-8
+ * content. On error, return a `[file failed: …]` string that the
+ * caller can splice in directly — never throws. Distinguishing this
+ * from a successful read lets the caller skip recursive expansion
+ * (which would otherwise try to expand an error string).
  */
+async function loadFileRaw(relPath: string, cwd: string): Promise<string> {
+	const absPath = resolveFilePath(relPath, cwd);
+	try {
+		return await fs.readFile(absPath, "utf-8");
+	} catch (err) {
+		return `[file failed: ${describeFileError(err)}]`;
+	}
+}
+
 /**
- * Replace every `!`...`` / `!```...```` occurrence in `text` with the
- * captured output of running the enclosed command in `cwd`. The
- * replacement text already includes any truncation footer (with the
- * temp-file path) so the LLM sees the full provenance inline.
+ * If `content` fits in `maxBytes`, return it verbatim. Otherwise
+ * tail-truncate via pi's `truncateTail`, write the full content to a
+ * temp file, and return the truncated text + a `[Output truncated …
+ * Full output: <path>]` footer. Never throws.
+ */
+async function truncateOrKeep(
+	content: string,
+	maxBytes: number,
+): Promise<string> {
+	const truncation = truncateTail(content, { maxBytes });
+	if (!truncation.truncated) {
+		return truncation.content;
+	}
+	const fullOutputPath = await writeFullOutput(content);
+	const footer = `\n\n[Output truncated to last ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}. Full output: ${fullOutputPath}]`;
+	return truncation.content + footer;
+}
+
+/**
+ * Load each path in a `FileMatch`, recursively expand its content
+ * (so nested `!`/`@` patterns inside the loaded file are resolved),
+ * apply the per-file truncation cap, and format the joined output.
+ *
+ * Reads in parallel (`Promise.all`) since file I/O is independent.
+ * Each parallel task uses its own copy of `visited` so a file shared
+ * across tasks loads once per task — preventing races on the shared
+ * set while still giving us cycle detection inside a single chain.
+ */
+async function expandFileReferences(
+	match: FileMatch,
+	cwd: string,
+	timeoutMs: number,
+	maxFileBytes: number,
+	depth: number,
+	visited: Set<string>,
+): Promise<string> {
+	const tasks = match.paths.map(async (rawPath) => {
+		const p = rawPath.trim();
+		if (!p) return null;
+		const absPath = resolveFilePath(p, cwd);
+		if (visited.has(absPath)) {
+			// Circular reference: emit a clear inline marker instead of
+			// recursing (which would loop until the depth cap kills it).
+			const skipNote = `[file skipped: circular reference: ${p}]`;
+			return match.fenced ? `=== ${p} ===\n${skipNote}` : skipNote;
+		}
+		const rawContent = await loadFileRaw(p, cwd);
+		let content = rawContent;
+		// Only recurse into successfully-read files. An error string
+		// must not be parsed for further `@` references.
+		if (!content.startsWith("[file failed:")) {
+			const newVisited = new Set(visited);
+			newVisited.add(absPath);
+			content = await expandText(
+				content,
+				cwd,
+				timeoutMs,
+				maxFileBytes,
+				depth + 1,
+				newVisited,
+			);
+			content = await truncateOrKeep(content, maxFileBytes);
+		}
+		return match.fenced ? `=== ${p} ===\n${content}` : content;
+	});
+	const blocks = (await Promise.all(tasks)).filter(
+		(b): b is string => b !== null,
+	);
+	return blocks.join("\n\n");
+}
+
+/**
+ * Replace every `!`cmd`` / `!```sh\ncmd\n``` ` / `` @`path` `` /
+ * `@```\npaths\n``` ` occurrence in `text` with the corresponding
+ * output. Walks matches from the end so earlier byte offsets stay
+ * valid as we splice. Recurses into loaded file content (via the
+ * `depth` / `visited` parameters) so `@` references can chain.
  */
 async function expandText(
 	text: string,
 	cwd: string,
 	timeoutMs: number,
+	maxFileBytes: number,
+	depth = 0,
+	visited: Set<string> = new Set(),
 ): Promise<string> {
-	const matches = findCommandMatches(text);
+	// Hard cap on how deep `@` expansion may nest. Beyond this, the
+	// text is returned with whatever `@` references it still contains
+	// unexpanded — the LLM sees the unresolved syntax and can decide
+	// what to do (e.g., use `read`).
+	if (depth >= MAX_RECURSION_DEPTH) return text;
+
+	const matches = findAllMatches(text);
 	if (matches.length === 0) return text;
 
-	// Walk from the end so earlier indices stay valid as we splice.
 	let out = text;
 	for (let i = matches.length - 1; i >= 0; i--) {
-		const { start, end, command } = matches[i];
-		const { output } = await runCommand(command, cwd, timeoutMs);
-		out = out.slice(0, start) + output + out.slice(end);
+		const m = matches[i];
+		let replacement: string;
+		if (m.kind === "command") {
+			replacement = (await runCommand(m.command, cwd, timeoutMs)).output;
+		} else {
+			replacement = await expandFileReferences(
+				m,
+				cwd,
+				timeoutMs,
+				maxFileBytes,
+				depth,
+				visited,
+			);
+		}
+		out = out.slice(0, m.start) + replacement + out.slice(m.end);
 	}
 	return out;
 }
@@ -239,6 +428,7 @@ async function expandFile(
 	original: string,
 	cwd: string,
 	timeoutMs: number,
+	maxFileBytes: number,
 ): Promise<string> {
 	let mtimeMs = 0;
 	let size = original.length;
@@ -257,7 +447,7 @@ async function expandFile(
 		return cached.expanded;
 	}
 
-	const expanded = await expandText(original, cwd, timeoutMs);
+	const expanded = await expandText(original, cwd, timeoutMs, maxFileBytes);
 	expansionCache.set(filePath, { mtimeMs, size, expanded });
 	return expanded;
 }
@@ -314,6 +504,7 @@ function substituteInSystemPrompt(
 
 export default function cmdExpandExtension(pi: ExtensionAPI) {
 	const timeoutMs = DEFAULT_TIMEOUT_MS;
+	const maxFileBytes = DEFAULT_MAX_FILE_BYTES;
 
 	// We deliberately do NOT register a `user_bash` handler. When the
 	// user types `!cmd` at the start of a line, pi's interactive mode
@@ -326,27 +517,32 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 	// break pi's own `!!` (excludeFromContext) / cancellation / live
 	// streaming semantics. So we let pi own this path.
 
-	// --- 1) `!cmd` in a typed message OR inside a prompt template / skill
-	//     body -----------------------------------------------------
+	// --- 1) `!cmd` / `@path` in a typed message OR inside a prompt
+	//     template / skill body ------------------------------------
 	// The `input` event fires before skill/template expansion, so it only
 	// ever sees the raw `/template-name` text for template-sourced input
-	// (no `!` in it, can't help). The `message_end` event fires after
-	// template expansion with the final user message, so it sees the
-	// `!`...`` whether the user typed it directly or it came from a
-	// template body, and rewrites the user message in place before the
-	// LLM call.
+	// (no `!` or `@` in it, can't help). The `message_end` event fires
+	// after template expansion with the final user message, so it sees
+	// the `!`...`` / `` @`path` `` whether the user typed it directly or
+	// it came from a template body, and rewrites the user message in
+	// place before the LLM call.
 	//
 	// TUI trade-off: pi renders the user message into the chat history
 	// in `message_start` and does not re-render on `message_end` for the
 	// user role, so the on-screen text in the chat will show the raw
-	// `!`...`` form even though the LLM sees the expanded output. That
-	// is a pi design gap, not something this extension can paper over.
+	// `!`...`` / `` @`path` `` form even though the LLM sees the
+	// expanded output. That is a pi design gap, not something this
+	// extension can paper over.
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "user") return;
 		const text = extractUserText(event.message.content);
-		if (!text?.includes("!")) return;
+		if (!text) return;
+		// Fast path: nothing to expand if neither trigger character is
+		// present. Without this, we'd call `findAllMatches` for every
+		// message, even plain prose.
+		if (!text.includes("!") && !text.includes("@")) return;
 
-		const expanded = await expandText(text, ctx.cwd, timeoutMs);
+		const expanded = await expandText(text, ctx.cwd, timeoutMs, maxFileBytes);
 		if (expanded === text) return;
 		return {
 			message: {
@@ -362,8 +558,8 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 	// list (with `path` and `content`). No other event carries either:
 	// `agent_start` / `agent_end` / `context` / `message_end` /
 	// `turn_end` are all message- or lifecycle-scoped, not
-	// system-prompt-scoped. So if you want `!`cmd`` to expand inside
-	// `AGENTS.md` / `CLAUDE.md`, this hook is not optional.
+	// system-prompt-scoped. So if you want `!`cmd`` / `` @`path` `` to
+	// expand inside `AGENTS.md` / `CLAUDE.md`, this hook is not optional.
 	pi.on("before_agent_start", async (event, ctx) => {
 		const contextFiles = event.systemPromptOptions?.contextFiles;
 		if (!contextFiles || contextFiles.length === 0) return;
@@ -372,12 +568,13 @@ export default function cmdExpandExtension(pi: ExtensionAPI) {
 		let changed = false;
 
 		for (const file of contextFiles) {
-			if (!file.content.includes("!")) continue;
+			if (!file.content.includes("!") && !file.content.includes("@")) continue;
 			const expanded = await expandFile(
 				file.path,
 				file.content,
 				ctx.cwd,
 				timeoutMs,
+				maxFileBytes,
 			);
 			if (expanded === file.content) continue;
 

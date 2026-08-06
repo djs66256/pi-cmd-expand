@@ -203,4 +203,28 @@ describe("user-message expansion path: LLM must see the expanded text, not the r
 			`cwd: ${require("node:fs").realpathSync(process.cwd())}`,
 		);
 	});
+
+	test("inline `@`file` form: LLM receives the file content", async () => {
+		const { mkdtempSync, writeFileSync, rmSync } = require("node:fs");
+		const { tmpdir } = require("node:os");
+		const { join } = require("node:path");
+		const tmp = mkdtempSync(join(tmpdir(), "pi-cmd-expand-pt-"));
+		try {
+			const f = join(tmp, "snippet.txt");
+			writeFileSync(f, "FROM-FILE");
+			const userMessage = {
+				role: "user",
+				content: [{ type: "text", text: `load: @\`${f}\`` }],
+				timestamp: 1700000000000,
+			};
+			let seen = null;
+			await replayPromptTemplatePath(userMessage, (llmCtx) => {
+				seen = llmCtx.messages.find((m) => m.role === "user")?.content?.[0]
+					?.text;
+			});
+			assert.equal(seen, "load: FROM-FILE");
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
 });
