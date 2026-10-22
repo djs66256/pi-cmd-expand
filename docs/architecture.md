@@ -102,6 +102,13 @@ extension registers, so a regression is caught at `npm test`.
 
 ## Imports we use
 
+`@earendil-works/pi-coding-agent` is **host-provided**: pi injects it
+into extensions via loader aliases / virtual modules. It is therefore
+declared as a `peerDependency` with a `"*"` range (and pinned to the
+current host version only as a `devDependency` for local tests) — never
+as a regular `dependency`, which would install a second copy of pi
+inside the extension and create duplicate runtime modules.
+
 From `@earendil-works/pi-coding-agent`:
 
 - `ExtensionAPI` (type) — the API surface.

@@ -46,6 +46,11 @@ npm test                              # node --test, jiti-loaded TS
 npm test -- --test-reporter=spec      # prettier output
 ```
 
+`@earendil-works/pi-coding-agent` is host-provided: it must stay in
+`peerDependencies` with a `"*"` range (plus a `devDependency` pin for
+local tests). Declaring it as a regular `dependency` makes pi warn and
+installs a duplicate copy of pi.
+
 Tests build a hand-rolled `ExtensionAPI` stub and call the registered
 handlers directly — they do **not** spawn a real pi session.
 `prompt-template-path.test.mjs` additionally replays the full pi code
